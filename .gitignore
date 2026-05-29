@@ -3,6 +3,7 @@
 /_pycache/
 *.pyc*
 __pycache__/
+build/
 .venv/
 .vscode/
 .env
