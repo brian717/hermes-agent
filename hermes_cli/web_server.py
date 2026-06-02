@@ -3904,6 +3904,38 @@ def _session_latest_descendant(session_id: str):
     finally:
         db.close()
 
+@app.get("/api/sessions/stats")
+async def get_session_stats():
+    """Session-store statistics for the Sessions page (mirrors `hermes sessions stats`).
+
+    Registered before ``/api/sessions/{session_id}`` so the literal ``stats``
+    path isn't captured as a session id by the parameterized route.
+    """
+    from hermes_state import SessionDB
+
+    db = SessionDB()
+    try:
+        total = db.session_count(include_archived=True)
+        active_store = db.session_count(include_archived=False)
+        archived = db.session_count(archived_only=True)
+        messages = db.message_count()
+        by_source: Dict[str, int] = {}
+        try:
+            for s in db.list_sessions_rich(limit=10000, include_archived=True):
+                src = str(s.get("source") or "cli")
+                by_source[src] = by_source.get(src, 0) + 1
+        except Exception:
+            pass
+        return {
+            "total": total,
+            "active_store": active_store,
+            "archived": archived,
+            "messages": messages,
+            "by_source": by_source,
+        }
+    finally:
+        db.close()
+
 @app.get("/api/sessions/{session_id}")
 async def get_session_detail(session_id: str):
     from hermes_state import SessionDB
@@ -3992,6 +4024,49 @@ async def rename_session_endpoint(session_id: str, body: SessionRename):
         if body.archived is not None:
             result["archived"] = bool(body.archived)
         return result
+    finally:
+        db.close()
+
+
+@app.get("/api/sessions/{session_id}/export")
+async def export_session_endpoint(session_id: str):
+    """Export a single session (metadata + messages) as JSON."""
+    from hermes_state import SessionDB
+
+    db = SessionDB()
+    try:
+        sid = db.resolve_session_id(session_id)
+        if not sid:
+            raise HTTPException(status_code=404, detail="Session not found")
+        data = db.export_session(sid)
+        if data is None:
+            raise HTTPException(status_code=404, detail="Session not found")
+        return data
+    finally:
+        db.close()
+
+
+class SessionPrune(BaseModel):
+    older_than_days: int = 90
+    source: Optional[str] = None
+
+
+@app.post("/api/sessions/prune")
+async def prune_sessions_endpoint(body: SessionPrune):
+    """Delete ended sessions older than N days (mirrors `hermes sessions prune`)."""
+    if body.older_than_days < 1:
+        raise HTTPException(status_code=400, detail="older_than_days must be >= 1")
+    from hermes_state import SessionDB
+
+    db = SessionDB()
+    try:
+        sessions_dir = get_hermes_home() / "sessions"
+        removed = db.prune_sessions(
+            older_than_days=body.older_than_days,
+            source=(body.source or None),
+            sessions_dir=sessions_dir if sessions_dir.exists() else None,
+        )
+        return {"ok": True, "removed": removed}
     finally:
         db.close()
 
@@ -5301,6 +5376,46 @@ async def update_skills_hub():
         _log.exception("Failed to spawn skills update")
         raise HTTPException(status_code=500, detail=f"Failed to update skills: {exc}")
     return {"ok": True, "pid": proc.pid, "name": "skills-update"}
+
+
+@app.get("/api/skills/hub/search")
+async def search_skills_hub(q: str = "", source: str = "all", limit: int = 20):
+    """Search the skill hub across all configured sources.
+
+    Network-bound (parallel source search); runs in a thread so the FastAPI
+    loop isn't blocked.  Returns structured results the UI installs by
+    identifier via POST /api/skills/hub/install.
+    """
+    query = (q or "").strip()
+    if not query:
+        return {"results": []}
+
+    def _run():
+        from tools.skills_hub import create_source_router, unified_search
+
+        sources = create_source_router()
+        metas = unified_search(
+            query, sources, source_filter=source or "all", limit=min(max(limit, 1), 50)
+        )
+        return [
+            {
+                "name": m.name,
+                "description": m.description,
+                "source": m.source,
+                "identifier": m.identifier,
+                "trust_level": m.trust_level,
+                "repo": m.repo,
+                "tags": list(m.tags or []),
+            }
+            for m in metas
+        ]
+
+    try:
+        results = await asyncio.to_thread(_run)
+    except Exception as exc:
+        _log.exception("skills hub search failed")
+        raise HTTPException(status_code=502, detail=f"Hub search failed: {exc}")
+    return {"results": results}
 
 
 # ---------------------------------------------------------------------------
