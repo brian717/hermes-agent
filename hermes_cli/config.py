@@ -1337,6 +1337,20 @@ DEFAULT_CONFIG = {
             "timeout": 600,
             "extra_body": {},
         },
+        # Proactive monitor — urgency/importance classifier for the
+        # proactive-monitor optional skill. Polls a source (inbox, feed, API),
+        # scores each item, and only above-threshold items get delivered.
+        # "auto" = use main chat model; override to a cheap fast model
+        # (e.g. openrouter google/gemini-3-flash-preview, haiku) since
+        # per-item classification is high-volume and a small model suffices.
+        "monitor": {
+            "provider": "auto",
+            "model": "",
+            "base_url": "",
+            "api_key": "",
+            "timeout": 60,
+            "extra_body": {},
+        },
     },
     
     "display": {
