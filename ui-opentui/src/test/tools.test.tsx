@@ -12,8 +12,11 @@
 import { describe, expect, test, vi } from 'vitest'
 
 import { createSessionStore, type ToolPartState } from '../logic/store.ts'
+import { DEFAULT_THEME } from '../logic/theme.ts'
 import { App } from '../view/App.tsx'
+import { reasoningLabelStyle } from '../view/reasoningPart.tsx'
 import { ThemeProvider } from '../view/theme.tsx'
+import { toolNameStyle } from '../view/toolPart.tsx'
 import { BashToolBody, commandOf } from '../view/tools/bashTool.tsx'
 import { diffOutputPlan, FileToolBody } from '../view/tools/fileTool.tsx'
 import { renderProbe, type RenderProbe } from './lib/render.ts'
@@ -562,6 +565,150 @@ describe('tool lifecycle states — running / done / failed (Epic 2.5)', () => {
     } finally {
       probe.destroy()
     }
+  })
+})
+
+describe('HERMES_TUI_TOOL_OUTPUT_LINES — expanded-output line cap (TUI-only env var)', () => {
+  const ENV = 'HERMES_TUI_TOOL_OUTPUT_LINES'
+
+  /** Run `fn` with the flag set to `value` (undefined → unset), restoring after. */
+  async function withFlag(value: string | undefined, fn: () => Promise<void> | void) {
+    const prev = process.env[ENV]
+    if (value === undefined) delete process.env[ENV]
+    else process.env[ENV] = value
+    try {
+      await fn()
+    } finally {
+      if (prev === undefined) delete process.env[ENV]
+      else process.env[ENV] = prev
+    }
+  }
+
+  test('flag=0 (unlimited): a 250-line output renders ALL lines with NO "+N more lines" note', async () => {
+    await withFlag('0', async () => {
+      const lines = Array.from({ length: 250 }, (_, i) => `row-${String(i + 1).padStart(3, '0')}`)
+      const part: ToolPartState = {
+        type: 'tool',
+        id: 'u1',
+        name: 'terminal',
+        state: 'complete',
+        args: { command: 'seq 1 250' },
+        resultText: lines.join('\n')
+      }
+      const probe = await renderProbe(
+        () => (
+          <ThemeProvider>
+            <BashToolBody part={part} width={70} />
+          </ThemeProvider>
+        ),
+        { width: 80, height: 260 }
+      )
+      try {
+        const frame = await probe.waitForFrame(f => f.includes('row-250'))
+        expect(frame).toContain('row-001')
+        expect(frame).toContain('row-200')
+        expect(frame).toContain('row-201') // beyond the old 200-line cap…
+        expect(frame).toContain('row-250') // …down to the very last line
+        expect(frame).not.toContain('more lines') // and no truncation note
+      } finally {
+        probe.destroy()
+      }
+    })
+  })
+
+  test('flag unset: the same 250-line output still caps at 200 + the honest note (default unchanged)', async () => {
+    await withFlag(undefined, async () => {
+      const lines = Array.from({ length: 250 }, (_, i) => `row-${String(i + 1).padStart(3, '0')}`)
+      const part: ToolPartState = {
+        type: 'tool',
+        id: 'u2',
+        name: 'terminal',
+        state: 'complete',
+        args: { command: 'seq 1 250' },
+        resultText: lines.join('\n')
+      }
+      const probe = await renderProbe(
+        () => (
+          <ThemeProvider>
+            <BashToolBody part={part} width={70} />
+          </ThemeProvider>
+        ),
+        { width: 80, height: 260 }
+      )
+      try {
+        const frame = await probe.waitForFrame(f => f.includes('+50 more lines'))
+        expect(frame).toContain('row-200')
+        expect(frame).not.toContain('row-201')
+        expect(frame).toContain('… +50 more lines')
+      } finally {
+        probe.destroy()
+      }
+    })
+  })
+
+  test('store: flag set + gateway tail-cap (omittedNote) + full raw result → body derived from the raw result', async () => {
+    const full = Array.from({ length: 250 }, (_, i) => `full-${i + 1}`).join('\n')
+    const cappedTail = ['full-241', 'full-242', 'full-243'].join('\n') // what the gateway kept
+    const payload = {
+      tool_id: 'p1',
+      name: 'terminal',
+      args: { command: 'seq 1 250' },
+      result_text: `[showing verbose tail; omitted 240 lines / 2000 chars]\n${cappedTail}`,
+      result: { output: full, exit_code: 0 }
+    }
+    const partOf = (store: Store) =>
+      store.state.messages[store.state.messages.length - 1]?.parts?.find(
+        (p): p is ToolPartState => p.type === 'tool' && p.id === 'p1'
+      )
+
+    await withFlag('0', () => {
+      const store = createSessionStore()
+      seedTool(store, { tool_id: 'p1', name: 'terminal' }, payload)
+      const part = partOf(store)
+      // the FULL raw result wins: longer than the capped tail, head included
+      expect(part?.resultText).toContain('full-1\n')
+      expect(part?.resultText).toContain('full-250')
+      expect(part?.omittedNote).toBeUndefined() // the note no longer applies
+    })
+
+    // flag UNSET → today's behavior: the gateway tail + the tidy omitted note
+    await withFlag(undefined, () => {
+      const store = createSessionStore()
+      seedTool(store, { tool_id: 'p1', name: 'terminal' }, payload)
+      const part = partOf(store)
+      expect(part?.resultText).toBe(cappedTail)
+      expect(part?.resultText).not.toContain('full-1\n')
+      expect(part?.omittedNote).toBe('240 lines / 2000 chars')
+    })
+
+    // flag set but NO raw result on the wire → keep the tail + note (no crash)
+    await withFlag('0', () => {
+      const store = createSessionStore()
+      const withoutRaw: Record<string, unknown> = { ...payload }
+      delete withoutRaw['result']
+      seedTool(store, { tool_id: 'p1', name: 'terminal' }, withoutRaw)
+      const part = partOf(store)
+      expect(part?.resultText).toBe(cappedTail)
+      expect(part?.omittedNote).toBe('240 lines / 2000 chars')
+    })
+  })
+})
+
+describe('tool-name emphasis + thought styling (feedback: undifferentiated muted rows)', () => {
+  const color = DEFAULT_THEME.color
+
+  test('toolNameStyle: settled name is PRIMARY (text color + bold); subtitle stays muted by the shell', () => {
+    expect(toolNameStyle({ failed: false, running: false }, color)).toEqual({ bold: true, fg: color.text })
+    expect(color.text).not.toBe(color.muted) // the emphasis is real, not a no-op
+  })
+
+  test('toolNameStyle: failed keeps the error coloring (it wins), running keeps its muted treatment', () => {
+    expect(toolNameStyle({ failed: true, running: false }, color)).toEqual({ bold: true, fg: color.error })
+    expect(toolNameStyle({ failed: false, running: true }, color)).toEqual({ bold: false, fg: color.muted })
+  })
+
+  test('reasoningLabelStyle: muted + ITALIC — a different KIND of row than a tool, never louder', () => {
+    expect(reasoningLabelStyle(color)).toEqual({ fg: color.muted, italic: true })
   })
 })
 

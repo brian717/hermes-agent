@@ -13,11 +13,24 @@
  */
 import { createMemo, createSignal, Show } from 'solid-js'
 
+import type { ThemeColors } from '../logic/theme.ts'
 import { Markdown } from './markdown.tsx'
 import { useScrollAnchor } from './scrollAnchor.tsx'
 import { useTheme } from './theme.tsx'
 
 const GUTTER = 2
+
+/**
+ * Header label style — reasoning is the MOST secondary tier, so the word
+ * Thinking/Thought + its title preview stay muted but render ITALIC: a
+ * `▶ Thought` row reads as a different KIND of row than a tool at a glance
+ * (tools carry a bold text-colored name; reasoning stays quiet, just
+ * recognizably distinct). Exported so tests can pin the selection logic
+ * (char frames carry no color/attribute info).
+ */
+export function reasoningLabelStyle(color: ThemeColors): { fg: string; italic: boolean } {
+  return { fg: color.muted, italic: true }
+}
 
 /** Split a leading `**Title**\n\n body` into {title, body} (opencode reasoningSummary). */
 function reasoningSummary(text: string): { title?: string; body: string } {
@@ -51,11 +64,12 @@ export function ReasoningPart(props: { text: string; streaming?: boolean }) {
               — chrome, not the reasoning body — so a free-form drag yields only
               the markdown body below, not the section label (item 4). */}
           <text selectable={false}>
-            {/* accent chevron marks it; muted label keeps reasoning in the dim,
-                secondary tier alongside tool calls (Ink hierarchy). */}
-            <span style={{ fg: theme().color.muted }}>{label()}</span>
+            {/* accent chevron marks it; muted ITALIC label keeps reasoning the
+                most secondary tier AND visibly a different kind of row than a
+                tool (bold name) — see reasoningLabelStyle. */}
+            <span style={reasoningLabelStyle(theme().color)}>{label()}</span>
             <Show when={summary().title}>
-              <span style={{ fg: theme().color.muted }}>{`: ${summary().title}`}</span>
+              <span style={reasoningLabelStyle(theme().color)}>{`: ${summary().title}`}</span>
             </Show>
           </text>
         </box>

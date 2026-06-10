@@ -8,19 +8,31 @@
  *     `(N fields)` / `(N items)` (opencode's primitive-only `input()` idea)
  * A single field whose value already equals the header's primary-arg preview is
  * hidden (it adds nothing over the header). The output body keeps the store's
- * envelope-stripped text, capped to EXPANDED_MAX with the honest omitted /
- * "+N more lines" notes. `ToolOutputBlock` is shared with the per-tool
- * renderers (bash, …). Fully themed; labels/notes are chrome (selectable=false).
+ * envelope-stripped text, capped to the expanded-lines cap (the
+ * HERMES_TUI_TOOL_OUTPUT_LINES env var; default 200, 0 → unlimited) with the
+ * honest omitted / "+N more lines" notes. `ToolOutputBlock` is shared with the
+ * per-tool renderers (bash, …). Fully themed; labels/notes are chrome
+ * (selectable=false).
  */
 import { createMemo, For, Show } from 'solid-js'
 
+import { envOutputLines } from '../../logic/env.ts'
 import type { ToolPartState } from '../../logic/store.ts'
 import { collapseToolOutput, truncate } from '../../logic/toolOutput.ts'
 import { useTheme } from '../theme.tsx'
 import type { ToolBodyProps, ToolRenderer } from './registry.tsx'
 
-/** Max output lines shown when expanded (a sane cap to avoid huge renders). */
-export const EXPANDED_MAX = 200
+/**
+ * Max output lines shown when expanded — `HERMES_TUI_TOOL_OUTPUT_LINES` (a
+ * TUI-only env var, not a config.yaml knob): unset/garbage → 200 (a sane cap
+ * to avoid huge renders), positive int → that cap, `0` → Infinity (unlimited).
+ * Memory note: this is safe to lift — tool rows mount collapsed (no body), and
+ * the rolling HERMES_TUI_MAX_MESSAGES cap bounds the transcript's Yoga-node
+ * high-water mark; an expanded body's nodes free on collapse/unmount.
+ */
+export function expandedMaxLines(): number {
+  return envOutputLines(process.env.HERMES_TUI_TOOL_OUTPUT_LINES)
+}
 /** Max labeled arg fields shown when expanded. */
 const FIELDS_MAX = 16
 
@@ -89,13 +101,13 @@ export function defaultSubtitle(part: ToolPartState): string {
 
 /**
  * The output section of an expanded tool body — shared by the default and the
- * per-tool renderers. Caps to EXPANDED_MAX and renders the honest truncation
- * notes (`omittedNote` from the gateway cap; "+N more lines" from ours).
+ * per-tool renderers. Caps to expandedMaxLines() and renders the honest
+ * truncation notes (`omittedNote` from the gateway cap; "+N more lines" from ours).
  */
 export function ToolOutputBlock(props: { part: ToolPartState; width: number; label?: boolean }) {
   const theme = useTheme()
   const result = () => (props.part.resultText ?? '').replace(/\s+$/, '')
-  const body = createMemo(() => collapseToolOutput(result(), EXPANDED_MAX, props.width))
+  const body = createMemo(() => collapseToolOutput(result(), expandedMaxLines(), props.width))
   return (
     <Show when={result()}>
       {/* section label — chrome, not content */}

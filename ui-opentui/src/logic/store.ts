@@ -22,6 +22,7 @@ import {
   type SessionInfoPatchDecoded
 } from '../boundary/schema/SessionInfo.ts'
 import { diffStats, type DiffStats } from './diff.ts'
+import { envOutputLinesSet } from './env.ts'
 import { stripAnsi, stripOmittedNote, stripToolEnvelope } from './toolOutput.ts'
 import { DEFAULT_THEME, type Theme, themeFromSkin } from './theme.ts'
 
@@ -679,9 +680,26 @@ export function createSessionStore() {
         // (so e.g. bash output still renders in non-verbose sessions). Then peel
         // the gateway's "[showing verbose tail; omitted …]" label (item 2) before
         // envelope-stripping, so the body is clean and the note renders tidily.
-        const { body: rawBody, omittedNote } = stripOmittedNote(
+        let { body: rawBody, omittedNote } = stripOmittedNote(
           readStr(event.payload, 'result_text') ?? stringifyResult(event.payload['result']) ?? summary ?? ''
         )
+        // HERMES_TUI_TOOL_OUTPUT_LINES set → the user explicitly controls how much
+        // output the expanded view shows, but a gateway-capped `result_text`
+        // (omittedNote) is only a TAIL — substituting the always-full raw `result`
+        // is the only way flag=0 (unlimited) can actually show everything. Same
+        // display pipeline (envelope strip) — and the same raw-result redaction
+        // tradeoff — as the existing non-verbose stringifyResult fallback above.
+        // The omitted note no longer applies to the full body; "+N more lines"
+        // (view-side) stays honest for caps below the full length. File-edit JSON
+        // results stay parseable, so fileTool's diffOutputPlan still suppresses
+        // the diff echo. The redacted-argsText precedence is untouched.
+        if (omittedNote && envOutputLinesSet(process.env.HERMES_TUI_TOOL_OUTPUT_LINES)) {
+          const full = stringifyResult(event.payload['result'])
+          if (full !== undefined) {
+            rawBody = full
+            omittedNote = undefined
+          }
+        }
         const resultText = stripToolEnvelope(rawBody)
         const lineCount = resultText ? resultText.replace(/\s+$/, '').split('\n').length : 0
         // `args` (full dict) is always sent; stringify as the expanded-view args

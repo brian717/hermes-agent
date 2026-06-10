@@ -20,6 +20,7 @@
  * copies only the expanded body content. Fully themed (no hardcoded styles).
  */
 import { type ToolPartState } from '../logic/store.ts'
+import type { ThemeColors } from '../logic/theme.ts'
 import { useDimensions } from './dimensions.tsx'
 import { createSignal, Show } from 'solid-js'
 
@@ -47,6 +48,24 @@ function fmtElapsed(s: number): string {
   const m = Math.floor(s / 60)
   const r = s % 60
   return r ? `${m}m ${r}s` : `${m}m`
+}
+
+/**
+ * Header tool-NAME style — the name is the PRIMARY cue for what a settled tool
+ * IS, so it renders in the primary text color + BOLD (the transcript otherwise
+ * reads as undifferentiated muted rows). The failed state's error coloring
+ * wins (still bold — failures should be unmistakable alongside the ✗ glyph);
+ * a running part keeps its current muted treatment (the ⚡ glyph + live
+ * elapsed already carry the running signal). Exported so tests can pin the
+ * selection logic (char frames carry no color/attribute info).
+ */
+export function toolNameStyle(
+  state: { failed: boolean; running: boolean },
+  color: ThemeColors
+): { fg: string; bold: boolean } {
+  if (state.failed) return { bold: true, fg: color.error }
+  if (state.running) return { bold: false, fg: color.muted }
+  return { bold: true, fg: color.text }
 }
 
 /**
@@ -92,8 +111,9 @@ export function ToolPart(props: { part: ToolPartState }) {
   // expandable body. `error` only lands on tool.complete, so running stays ⚡.
   const failed = () => !running() && Boolean(props.part.error)
   const headGlyph = () => (failed() ? '✗' : collapsible() ? (expanded() ? '▼' : '▶') : '⚡')
-  // accent glyph MARKS the tool (draws the eye); the rest is muted so tools read
-  // as the dim, secondary tier below the bright assistant answer (Ink hierarchy).
+  // accent glyph MARKS the tool (draws the eye); the NAME is primary (bold text
+  // via toolNameStyle) so WHAT the tool is reads at a glance; subtitle/metadata
+  // stay muted — the secondary tier below the bright assistant answer.
   const headColor = () => (failed() ? theme().color.error : theme().color.accent)
   const subWidth = () => Math.max(1, bodyWidth() - props.part.name.length - 2)
 
@@ -114,7 +134,11 @@ export function ToolPart(props: { part: ToolPartState }) {
               free-form drag over a tool yields only the expanded body content,
               never the header label. */}
           <text selectable={false}>
-            <span style={{ fg: theme().color.muted }}>{props.part.name}</span>
+            {/* the NAME is the primary cue (text + bold; error when failed;
+                muted while running) — see toolNameStyle. Subtitle stays muted. */}
+            <span style={toolNameStyle({ failed: failed(), running: running() }, theme().color)}>
+              {props.part.name}
+            </span>
             {/* subtitle shows while running too (the gateway argsPreview — e.g.
                 the command being executed) so a running tool reads `⚡ terminal
                 sleep 8 · 12s`, Ink parity. */}
