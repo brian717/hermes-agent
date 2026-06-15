@@ -140,6 +140,8 @@ jobs:
         run: |
           winget install -e --id AutoHotkey.AutoHotkey --silent --accept-source-agreements --accept-package-agreements --disable-interactivity
           $ahkDir = "$env:LOCALAPPDATA\Programs\AutoHotkey\v2"
+          ls $ahkDir
+          exit 1
           Add-Content -Path $env:GITHUB_PATH -Value $ahkDir
 
       - name: Install ffmpeg
@@ -147,6 +149,8 @@ jobs:
         run: |
           winget install -e --id Gyan.FFmpeg --silent --accept-source-agreements --accept-package-agreements --disable-interactivity
           $wingetLinks = "$env:LOCALAPPDATA\Microsoft\WinGet\Links"
+          ls $wingetLinks
+          exit 1
           echo $wingetLinks | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
       # ── Stage the real installer binary as a user download ──────────
