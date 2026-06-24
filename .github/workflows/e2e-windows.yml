@@ -194,18 +194,17 @@ jobs:
           # ffmpeg's progress output would fill the pipe buffer and block.
           Write-Host "ffmpeg recording started (pid $($ffmpeg.Id ))"
 
+          $e2eDir = "$env:RUNNER_TEMP\e2e-windows"
+
+          Copy-Item -Path "$env:INSTALL_DIR\e2e\windows"  -Destination $e2eDir -Force
+
+          ls $e2eDir
+          throw "fail after ls"
           $installerSuccess = $false
           try {
             # Launch the real installer
             $proc = Start-Process -FilePath $installer -PassThru -NoNewWindow
             $proc.Id | Out-File installer.pid
-
-            $e2eDir = "$env:RUNNER_TEMP\e2e-windows"
-
-            Copy-Item -Path "$env:INSTALL_DIR\e2e\windows"  -Destination $e2eDir -Force
-
-            ls $e2eDir
-            throw "fail after ls"
 
             $ahkProc = Start-Process -FilePath ".\test-bins\autohotkey\AutoHotkey64.exe" `
               -ArgumentList "$e2eDir\install-hermes-desktop.ahk", "$PWD\ahk.log" -PassThru -NoNewWindow
