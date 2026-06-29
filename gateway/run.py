@@ -15674,26 +15674,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             elif preview:
                 from agent.display import (
                     get_tool_preview_max_len,
-                    get_friendly_tool_labels,
-                    build_tool_label,
+                    get_tool_verb,
+                    tool_verb_connector,
+                    verb_drops_preview,
                 )
                 _pl = get_tool_preview_max_len()
                 _cap = _pl if _pl > 0 else 40
-                # Friendly labels: render a human-phrased line
-                # ("🔍 Searching the web for ...") for built-in tools instead
-                # of the raw "web_search: ..." form.  Falls back to the
-                # tool_name preview for custom/plugin/MCP tools or when the
-                # feature is disabled.
-                _label = (
-                    build_tool_label(tool_name, args, max_len=_cap)
-                    if (get_friendly_tool_labels() and isinstance(args, dict))
-                    else None
-                )
-                if _label:
-                    msg = f"{emoji} {_label}"
+                if len(preview) > _cap:
+                    preview = preview[:_cap - 3] + "..."
+                # Friendly labels: render a human-phrased line for built-in
+                # tools ("🔍 Searching the web for ...") by prefixing the verb
+                # onto the preview the callback already computed (so the
+                # command/url/query is preserved).  Custom/plugin/MCP tools
+                # have no verb and fall back to the raw "tool_name: ..." form.
+                _verb = get_tool_verb(tool_name)
+                if _verb:
+                    if verb_drops_preview(tool_name):
+                        msg = f"{emoji} {_verb}"
+                    else:
+                        msg = f"{emoji} {_verb}{tool_verb_connector(tool_name)}{preview}"
                 else:
-                    if len(preview) > _cap:
-                        preview = preview[:_cap - 3] + "..."
                     msg = f"{emoji} {tool_name}: \"{preview}\""
                 last_was_terminal_block[0] = False
             else:

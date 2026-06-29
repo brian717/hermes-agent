@@ -603,6 +603,29 @@ def get_friendly_tool_labels() -> bool:
     return _friendly_tool_labels
 
 
+def get_tool_verb(tool_name: str) -> str | None:
+    """Return the friendly verb for a built-in tool, or None.
+
+    Returns None when friendly labels are disabled or the tool has no curated
+    verb (custom/plugin/MCP tools).  Callers that already hold a computed
+    argument preview can compose ``f"{verb} {preview}"`` themselves; use
+    :func:`tool_verb_connector` to pick the right joiner.
+    """
+    if not _friendly_tool_labels:
+        return None
+    return _TOOL_VERBS.get(tool_name)
+
+
+def tool_verb_connector(tool_name: str) -> str:
+    """Return the connector between a verb and its preview (" for " or " ")."""
+    return " for " if tool_name in _TOOL_VERBS_FOR_CONNECTOR else " "
+
+
+def verb_drops_preview(tool_name: str) -> bool:
+    """Whether the verb should render alone, without the argument preview."""
+    return tool_name in _TOOL_VERBS_NO_PREVIEW
+
+
 def build_tool_label(tool_name: str, args: dict, max_len: int | None = None) -> str | None:
     """Build a human-phrased status label for a tool call.
 
