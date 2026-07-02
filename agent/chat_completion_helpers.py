@@ -2016,12 +2016,28 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         # 'stream_options'`), so omit it only for that endpoint.
         if not is_native_gemini_base_url(agent.base_url):
             stream_kwargs["stream_options"] = {"include_usage": True}
-        request_client = _set_request_client(
-            agent._create_request_openai_client(
-                reason="chat_completion_stream_request",
-                api_kwargs=stream_kwargs,
+        if agent.provider == "moa":
+            # MoA is a virtual chat-completions provider backed by the in-process
+            # MoAClient facade. Its runtime metadata points at the sentinel
+            # ``moa://local`` base_url, which has no real server — rebuilding a
+            # request-local OpenAI client from it (the ``else`` branch) makes the
+            # SDK dial ``moa://local`` and raise ``APIConnectionError`` on every
+            # streamed turn (e.g. Telegram / gateway platforms). Stream through
+            # the facade directly instead: it honours ``stream=True`` in
+            # ``stream_kwargs`` and returns the aggregator's raw token stream,
+            # which the consumer below reassembles like any other provider
+            # stream. Mirrors the ``provider == "moa"`` branch on the
+            # non-streaming path (``interruptible_api_call._call``). No
+            # request-local HTTP client is created, so the retry/cleanup path's
+            # ``_close_request_client_once`` correctly no-ops.
+            stream_client = agent.client
+        else:
+            stream_client = _set_request_client(
+                agent._create_request_openai_client(
+                    reason="chat_completion_stream_request",
+                    api_kwargs=stream_kwargs,
+                )
             )
-        )
         # Reset stale-stream timer so the detector measures from this
         # attempt's start, not a previous attempt's last chunk.
         last_chunk_time["t"] = time.time()
@@ -2031,7 +2047,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         # ``request_client_holder["diag"]`` for closure access.
         _diag = agent._stream_diag_init()
         request_client_holder["diag"] = _diag
-        stream = request_client.chat.completions.create(**stream_kwargs)
+        stream = stream_client.chat.completions.create(**stream_kwargs)
 
         # Some OpenAI-compatible adapters (for example copilot-acp, and the MoA
         # openai-codex aggregator) accept stream=True but still return a

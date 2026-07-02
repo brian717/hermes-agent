@@ -190,6 +190,52 @@ class TestStreamingAccumulator:
 
     @patch("run_agent.AIAgent._create_request_openai_client")
     @patch("run_agent.AIAgent._close_request_openai_client")
+    def test_moa_streams_through_facade_not_http_client(self, mock_close, mock_create):
+        """MoA on the streaming path must dispatch through the in-process
+        MoAClient facade (``agent.client``), never a request-local OpenAI
+        client rebuilt from the ``moa://local`` sentinel base_url.
+
+        Regression for #57251: the streaming ``_call_chat_completions`` only
+        had an ``anthropic_messages`` special case, so ``provider == "moa"``
+        fell through to the default branch, which dialed ``moa://local`` and
+        raised ``APIConnectionError`` on every streamed gateway turn. The
+        non-streaming path already had the ``moa`` branch.
+        """
+        from run_agent import AIAgent
+
+        facade = MagicMock()
+        facade.chat.completions.create.return_value = iter([
+            _make_stream_chunk(content="synth", finish_reason="stop", model="moa-agg"),
+            _make_empty_chunk(usage=SimpleNamespace(prompt_tokens=7, completion_tokens=1)),
+        ])
+
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="moa://local",
+            model="closed",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+        agent.api_mode = "chat_completions"
+        agent.provider = "moa"
+        # In production ``agent.client`` is the MoAClient facade; substitute a
+        # mock that yields OpenAI-shaped chunks so we exercise the dispatch.
+        agent.client = facade
+        agent._interrupt_requested = False
+
+        response = agent._interruptible_streaming_api_call({})
+
+        # The streamed synthesis came from the facade, reassembled normally.
+        assert response.choices[0].message.content == "synth"
+        # No request-local OpenAI client was built for the moa://local sentinel.
+        mock_create.assert_not_called()
+        # The facade was driven in streaming mode (stream=True forwarded).
+        assert facade.chat.completions.create.called
+        assert facade.chat.completions.create.call_args.kwargs["stream"] is True
+
+    @patch("run_agent.AIAgent._create_request_openai_client")
+    @patch("run_agent.AIAgent._close_request_openai_client")
     def test_tool_call_response(self, mock_close, mock_create):
         """Tool call stream accumulates ID, name, and arguments."""
         from run_agent import AIAgent
@@ -707,6 +753,11 @@ class TestStreamingFallback:
         )
         agent.api_mode = "chat_completions"
         agent._interrupt_requested = False
+        # MoA streams through the in-process facade (``agent.client``), not a
+        # rebuilt OpenAI client (#57251). This scenario — the aggregator handing
+        # back a completed response with empty/None ``choices`` instead of a
+        # token stream — is produced by the facade, so mock it there.
+        agent.client = mock_client
 
         deltas = []
         agent._stream_callback = lambda text: deltas.append(text)
