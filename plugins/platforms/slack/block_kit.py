@@ -451,6 +451,22 @@ def render_blocks(
                         indent, ordered, txt = items[-1]
                         items[-1] = (indent, ordered, txt + " " + lines[i].strip())
                         i += 1
+                    elif not lines[i].strip() and items:
+                        # Blank line inside a list: treat it as a soft separator
+                        # rather than a terminator, provided the list resumes
+                        # after it.  LLM-authored numbered lists routinely space
+                        # items with blank lines; without this each item would
+                        # become its own single-item rich_text_list and Slack
+                        # would reset ordered numbering to "1." on every item.
+                        j = i + 1
+                        while j < n and not lines[j].strip():
+                            j += 1
+                        if j < n and (
+                            _BULLET_RE.match(lines[j]) or _ORDERED_RE.match(lines[j])
+                        ):
+                            i = j  # skip the blank run; keep the list going
+                        else:
+                            break
                     else:
                         break
                 blocks.append(_list_block(items))

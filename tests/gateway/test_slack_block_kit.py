@@ -59,6 +59,39 @@ class TestNestedLists:
         assert max(indents) >= 2
         assert min(indents) == 0
 
+    def test_blank_separated_ordered_list_is_one_run(self):
+        # LLM output routinely spaces numbered items with blank lines.  Slack
+        # numbers each rich_text_list independently from 1, so the items must
+        # land in a SINGLE ordered rich_text_list or every item renders "1.".
+        md = "1. alpha\n\n1. beta\n\n1. gamma"
+        blocks = render_blocks(md)
+        lists = [
+            e
+            for b in blocks
+            if b["type"] == "rich_text"
+            for e in b["elements"]
+            if e["type"] == "rich_text_list"
+        ]
+        assert len(lists) == 1, "blank-separated items must stay one ordered list"
+        assert lists[0]["style"] == "ordered"
+        assert len(lists[0]["elements"]) == 3
+
+    def test_blank_line_after_list_still_ends_it(self):
+        # A blank line NOT followed by another list item must still terminate
+        # the list so trailing prose becomes its own paragraph section.
+        md = "1. alpha\n2. beta\n\nAfterwards, some prose."
+        blocks = render_blocks(md)
+        lists = [
+            e
+            for b in blocks
+            if b["type"] == "rich_text"
+            for e in b["elements"]
+            if e["type"] == "rich_text_list"
+        ]
+        assert len(lists) == 1
+        assert len(lists[0]["elements"]) == 2
+        assert any(b["type"] == "section" for b in blocks)
+
     def test_ordered_and_bullet_styles_distinguished(self):
         md = "1. first\n2. second\n\n- bullet"
         blocks = render_blocks(md)
