@@ -5,11 +5,11 @@ Reproduction for issue #7131: zombie process accumulation on long-running
 gateway deployments.
 """
 
-import os
-import signal
 import subprocess
 import sys
 import threading
+
+import psutil
 
 
 
@@ -21,12 +21,37 @@ def _spawn_sleep(seconds: float = 60) -> subprocess.Popen:
 
 
 def _pid_alive(pid: int) -> bool:
-    """Return True if a process with the given PID is still running."""
-    try:
-        os.kill(pid, 0)
-        return True
-    except (ProcessLookupError, PermissionError):
-        return False
+    """Return True if a process with the given PID is still running.
+
+    Uses ``psutil.pid_exists`` rather than ``os.kill(pid, 0)``: on Windows the
+    latter is not a liveness probe — it routes through the console ctrl-event /
+    TerminateProcess path (bpo-14484), so it can disturb or kill the target and
+    other processes sharing the console group instead of merely checking it
+    (issue #57145).
+    """
+    return psutil.pid_exists(pid)
+
+
+class TestPidAliveProbe:
+    """Regression coverage for issue #57145: the liveness probe must work
+    without ``os.kill(pid, 0)`` (a console ctrl-event broadcast on Windows)
+    and cleanup must not reference ``signal.SIGKILL`` (absent on Windows)."""
+
+    def test_pid_alive_true_while_running_false_after_exit(self):
+        proc = _spawn_sleep(60)
+        try:
+            assert _pid_alive(proc.pid) is True
+        finally:
+            proc.kill()
+            proc.wait(timeout=5)
+        # wait() has reaped the child, so the PID is no longer live.
+        assert _pid_alive(proc.pid) is False
+
+    def test_pid_alive_false_for_unused_pid(self):
+        # A PID we never spawned and that is astronomically unlikely to exist
+        # on any platform (Linux default pid_max is ~4M; Windows PIDs are far
+        # smaller). Must report not-alive rather than probing/killing anything.
+        assert _pid_alive(2_000_000_000) is False
 
 
 class TestZombieReproduction:
@@ -56,10 +81,13 @@ class TestZombieReproduction:
                     f"expected it to survive (demonstrating the bug)"
                 )
         finally:
+            # ``signal.SIGKILL`` does not exist on Windows and ``os.kill`` with
+            # a signal there is not portable; kill the tracked PIDs via psutil
+            # instead (issue #57145).
             for pid in pids:
                 try:
-                    os.kill(pid, signal.SIGKILL)
-                except (ProcessLookupError, PermissionError):
+                    psutil.Process(pid).kill()
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
                     pass
 
     def test_explicit_terminate_reaps_processes(self):

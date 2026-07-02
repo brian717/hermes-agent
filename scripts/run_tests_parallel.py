@@ -254,6 +254,23 @@ def _run_one_file(
     
     subproc_start = time.monotonic()
     # launch the pytest process
+    # Isolate each child so a stray console ctrl-event or an os.kill(pid, 0)
+    # probe in one test file cannot fan out to the sibling children or the
+    # runner itself (issue #57145).
+    #   POSIX: start_new_session places the child at the head of its own
+    #     process group so _kill_tree can SIGKILL the group atomically.
+    #   Windows: start_new_session only maps to CREATE_NEW_PROCESS_GROUP on
+    #     CPython 3.12+, so set the flag explicitly to also cover 3.11; add
+    #     CREATE_NO_WINDOW so children don't flash a console window.
+    #     _kill_tree handles the Windows path via taskkill /F /T.
+    if sys.platform == "win32":
+        isolation_kwargs = {
+            "creationflags": (
+                subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
+            )
+        }
+    else:
+        isolation_kwargs = {"start_new_session": True}
     proc = subprocess.Popen(
         cmd,
         cwd=repo_root,
@@ -262,11 +279,7 @@ def _run_one_file(
         text=True,
         # skipping writing bytecode because we're running a bunch of parallel python processes on the same code
         env={**os.environ, 'PYTHONDONTWRITEBYTECODE': '1'},
-        # POSIX: place the child at the head of its own process group so
-        # _kill_tree can SIGKILL the group atomically.
-        # Windows: this maps to CREATE_NEW_PROCESS_GROUP in CPython 3.12+;
-        # _kill_tree handles the Windows path via taskkill /F /T.
-        start_new_session=True,
+        **isolation_kwargs,
     )
 
     # Capture the pgid NOW, before the leader can exit and be reaped. Once
