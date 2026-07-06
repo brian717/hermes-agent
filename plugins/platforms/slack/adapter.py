@@ -36,6 +36,7 @@ from pathlib import Path as _Path
 
 sys.path.insert(0, str(_Path(__file__).resolve().parents[3]))
 
+from agent.secret_scope import get_secret
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.helpers import MessageDeduplicator
 from gateway.platforms.base import (
@@ -306,6 +307,21 @@ def _resolve_slack_proxy_url() -> Optional[str]:
         return None
 
     return proxy_url
+
+
+def _resolve_slack_app_token() -> Optional[str]:
+    """Resolve the Socket Mode app-level token, honoring the profile scope.
+
+    The app token (``xapp-...``) is a per-profile secret just like the bot
+    token, so it must be read through ``get_secret`` rather than ``os.getenv``.
+    In a multiplexed gateway every profile's adapter runs inside its own
+    ``_profile_runtime_scope``; reading ``os.environ`` directly would return the
+    default profile's token, so all profiles would open Socket Mode against the
+    default profile's Slack app and secondary profiles would silently receive no
+    events. Single-profile deployments fall back to ``os.environ`` unchanged
+    (see ``agent.secret_scope.get_secret``).
+    """
+    return get_secret("SLACK_APP_TOKEN")
 
 
 # Map Slack audio mimetypes to the file extension that matches the actual
@@ -960,7 +976,7 @@ class SlackAdapter(BasePlatformAdapter):
             return False
 
         raw_token = self.config.token
-        app_token = os.getenv("SLACK_APP_TOKEN")
+        app_token = _resolve_slack_app_token()
 
         if not raw_token:
             logger.error("[Slack] SLACK_BOT_TOKEN not set")
