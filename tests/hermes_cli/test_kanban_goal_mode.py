@@ -12,6 +12,7 @@ Covers three layers:
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from pathlib import Path
 
@@ -296,3 +297,73 @@ def test_loop_stops_if_task_reclaimed(monkeypatch):
         first_response="x",
     )
     assert res["outcome"] == "stopped"
+
+
+# ---------------------------------------------------------------------------
+# kanban_complete pre-completion judge gate (#59762)
+# ---------------------------------------------------------------------------
+
+def test_complete_gate_rejects_when_judge_not_done(kanban_home, monkeypatch):
+    """The goal-mode gate must honor a non-'done' judge verdict.
+
+    Regression for #59762: ``_handle_complete`` unpacked ``judge_goal()``'s
+    4-tuple ``(verdict, reason, parse_failed, wait_directive)`` into only
+    three targets, so every judge call raised ``ValueError``. That was
+    swallowed by the gate's defensive ``except`` (written for transport
+    errors), leaving ``verdict`` on its ``"done"`` initializer — so
+    completion was allowed unconditionally, exactly when a judge was
+    reachable and the gate was supposed to enforce.
+    """
+    from tools import kanban_tools
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="probe", assignee="worker", goal_mode=True
+        )
+
+    # Judge is reachable and says the goal is NOT met.
+    monkeypatch.setattr(kanban_tools, "_goal_judge_available", lambda: True)
+    monkeypatch.setattr(
+        kanban_tools,
+        "judge_goal",
+        lambda **kw: ("continue", "no acceptance evidence", False, None),
+    )
+
+    out = kanban_tools._handle_complete(
+        {"task_id": tid, "summary": "did nothing, no tests were run"}
+    )
+    payload = json.loads(out)
+    assert "error" in payload, f"expected a rejection, got: {payload}"
+    assert "rejected by judge" in payload["error"].lower()
+
+    # The card must NOT have completed.
+    with kb.connect() as conn:
+        task = kb.get_task(conn, tid)
+    assert task is not None and task.status != "done"
+
+
+def test_complete_gate_allows_when_judge_done(kanban_home, monkeypatch):
+    """A 'done' verdict passes the gate and the card completes normally."""
+    from tools import kanban_tools
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="probe", assignee="worker", goal_mode=True
+        )
+
+    monkeypatch.setattr(kanban_tools, "_goal_judge_available", lambda: True)
+    monkeypatch.setattr(
+        kanban_tools,
+        "judge_goal",
+        lambda **kw: ("done", "criteria met", False, None),
+    )
+
+    out = kanban_tools._handle_complete(
+        {"task_id": tid, "summary": "shipped and verified"}
+    )
+    payload = json.loads(out)
+    assert "error" not in payload, f"unexpected rejection: {payload}"
+
+    with kb.connect() as conn:
+        task = kb.get_task(conn, tid)
+    assert task is not None and task.status == "done"
