@@ -7,6 +7,7 @@ import {
   defaultVisibleKeys,
   effectiveVisibleKeys,
   emptyProviderSentinelKey,
+  filterConfiguredProviders,
   isProviderSentinel,
   modelVisibilityKey,
   resolveVisibleKeys,
@@ -222,5 +223,44 @@ describe('resolveVisibleKeys', () => {
 
   it('returns an empty set for an empty (non-null) stored set', () => {
     expect([...resolveVisibleKeys(new Set(), providers)]).toEqual([])
+  })
+})
+
+describe('filterConfiguredProviders', () => {
+  const authed = (slug: string, authenticated?: boolean): ModelOptionProvider => ({
+    authenticated,
+    models: [`${slug}-model`],
+    name: slug,
+    slug
+  })
+
+  const providers = [authed('deepseek', true), authed('openai', false), authed('nous', false)]
+
+  it('returns every provider unchanged when the toggle is off', () => {
+    const result = filterConfiguredProviders(providers, false)
+
+    expect(result.map(p => p.slug)).toEqual(['deepseek', 'openai', 'nous'])
+    // A fresh array is returned, never the caller's reference.
+    expect(result).not.toBe(providers)
+  })
+
+  it('drops providers whose credentials are explicitly missing when the toggle is on', () => {
+    const result = filterConfiguredProviders(providers, true)
+
+    expect(result.map(p => p.slug)).toEqual(['deepseek'])
+  })
+
+  it('treats a missing authenticated flag as configured (only explicit false is filtered)', () => {
+    const result = filterConfiguredProviders([authed('deepseek', true), authed('custom', undefined)], true)
+
+    expect(result.map(p => p.slug)).toEqual(['deepseek', 'custom'])
+  })
+
+  it('always keeps the current provider even when it is unconfigured', () => {
+    const result = filterConfiguredProviders(providers, true, 'openai')
+
+    // deepseek stays (authenticated), openai stays (it is the active provider),
+    // nous is dropped (unconfigured and not active).
+    expect(result.map(p => p.slug)).toEqual(['deepseek', 'openai'])
   })
 })

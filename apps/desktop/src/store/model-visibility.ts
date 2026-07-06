@@ -1,9 +1,10 @@
 import { atom } from 'nanostores'
 
-import { persistString, storedString } from '@/lib/storage'
+import { persistBoolean, persistString, storedBoolean, storedString } from '@/lib/storage'
 import type { ModelOptionProvider } from '@/types/hermes'
 
 const STORAGE_KEY = 'hermes.desktop.visible-models'
+const HIDE_UNCONFIGURED_KEY = 'hermes.desktop.hide-unconfigured-providers'
 
 /** Models shown per provider in the status-bar dropdown before the user has
  *  customized the list. Backend `models` are already relevance-ordered. */
@@ -97,6 +98,35 @@ export function setVisibleModels(keys: Set<string>): void {
 
 export function setModelVisibilityOpen(open: boolean): void {
   $modelVisibilityOpen.set(open)
+}
+
+/** When true, the picker hides providers without usable credentials — the
+ *  canonical rows surfaced with a setup affordance that the user hasn't set up.
+ *  Opt-in (default false) so the "show everything, incl. setup rows" behavior is
+ *  unchanged for users who don't enable it. (#59483) */
+export const $hideUnconfiguredProviders = atom<boolean>(storedBoolean(HIDE_UNCONFIGURED_KEY, false))
+
+export function setHideUnconfiguredProviders(hide: boolean): void {
+  $hideUnconfiguredProviders.set(hide)
+  persistBoolean(HIDE_UNCONFIGURED_KEY, hide)
+}
+
+/** Drop providers with no usable credentials when `hide` is on. A missing
+ *  `authenticated` flag is treated as configured — only an explicit `false`
+ *  (unconfigured canonical rows) is filtered. The current provider is always
+ *  kept so the active model never disappears from the picker. */
+export function filterConfiguredProviders(
+  providers: readonly ModelOptionProvider[],
+  hide: boolean,
+  currentProviderSlug?: string
+): ModelOptionProvider[] {
+  if (!hide) {
+    return [...providers]
+  }
+
+  return providers.filter(
+    provider => provider.authenticated !== false || provider.slug === currentProviderSlug
+  )
 }
 
 /** The default-visible key set: the curated top-N per provider. Used both as
