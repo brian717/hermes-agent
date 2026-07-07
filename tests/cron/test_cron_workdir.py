@@ -47,7 +47,15 @@ class TestNormalizeWorkdir:
 
     def test_tilde_expands(self, tmp_path, monkeypatch):
         from cron.jobs import _normalize_workdir
+        # `~` expansion is platform-specific: POSIX (posixpath) reads $HOME,
+        # while Windows (ntpath) reads %USERPROFILE% and then
+        # %HOMEDRIVE%+%HOMEPATH% — it never consults $HOME. Point every home
+        # source at tmp_path and clear the drive/path pair so the assertion
+        # holds on both platforms instead of encoding POSIX-only semantics.
         monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("USERPROFILE", str(tmp_path))
+        monkeypatch.delenv("HOMEDRIVE", raising=False)
+        monkeypatch.delenv("HOMEPATH", raising=False)
         result = _normalize_workdir("~")
         assert result == str(tmp_path.resolve())
 
