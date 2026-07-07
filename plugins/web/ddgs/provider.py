@@ -28,6 +28,26 @@ logger = logging.getLogger(__name__)
 _SEARCH_TIMEOUT_SECS = 30
 
 
+def _ensure_ddgs_installed() -> None:
+    """Trigger lazy install of the ``ddgs`` package if it isn't present.
+
+    Mirrors the exa/firecrawl/parallel providers: the SDK self-installs on
+    first *use* (never at availability-probe time — ``is_available()`` must
+    stay network-free). On sealed Docker images this redirects the install to
+    the durable target instead of the read-only venv (#60425). Swallows benign
+    ImportError from the lazy_deps helper itself; if ddgs is genuinely missing
+    the subsequent ``import ddgs`` raises an ImportError the caller handles.
+    """
+    try:
+        from tools.lazy_deps import ensure as _lazy_ensure
+
+        _lazy_ensure("search.ddgs", prompt=False)
+    except ImportError:
+        pass
+    except Exception as exc:  # noqa: BLE001 — surface install hint as ImportError
+        raise ImportError(str(exc))
+
+
 def _run_ddgs_search(query: str, safe_limit: int) -> list[dict[str, Any]]:
     """Run the blocking ddgs query and return normalized hits.
 
@@ -98,7 +118,11 @@ class DDGSWebSearchProvider(WebSearchProvider):
         wall-clock timeout (``_SEARCH_TIMEOUT_SECS``) so a hung search cannot
         block the shared agent loop indefinitely (#36776).
         """
+        # Lazy-install ddgs on first use (no-op when already present). On
+        # sealed Docker images this routes the install to the durable target
+        # rather than the read-only venv (#60425).
         try:
+            _ensure_ddgs_installed()
             import ddgs  # type: ignore  # noqa: F401 — availability probe
         except ImportError:
             return {

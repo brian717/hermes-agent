@@ -149,6 +149,10 @@ anthropic = ["anthropic==0.87.0"]  # CVE-2026-34450, CVE-2026-34452
 exa = ["exa-py==2.10.2"]
 firecrawl = ["firecrawl-py==4.17.0"]
 parallel-web = ["parallel-web==0.4.2"]
+# ddgs — keyless DuckDuckGo search (config default `web.backend: ddgs`).
+# Lazy-installed via LAZY_DEPS['search.ddgs']; excluded from [all] per the
+# lazy-install policy so a broken upstream release can't brick fresh installs.
+ddgs = ["ddgs==9.14.4"]
 # Image generation backends
 fal = ["fal-client==0.13.1"]
 # Edge TTS — default TTS provider but still optional (users can pick

@@ -347,6 +347,31 @@ def _ddgs_package_importable() -> bool:
     except ImportError:
         return False
 
+
+def _ddgs_lazy_installable() -> bool:
+    """Return True when ``ddgs`` is absent but can be lazy-installed on use.
+
+    ddgs is registered in :data:`tools.lazy_deps.LAZY_DEPS` and self-installs
+    on the first ``web_search`` call (see the ddgs provider). Unlike keyed
+    backends — whose ``is_available()`` reflects a configured API key and so
+    lights the tool up before the SDK is installed — ddgs has no key, so its
+    availability was tied purely to package presence. On a fresh/sealed image
+    that never bundles ddgs, ``check_web_api_key`` therefore reported the
+    default backend unavailable and ``web_search`` never lit up (#60425).
+
+    This mirrors the keyed-backend behaviour: when the user has selected ddgs
+    and lazy installs are permitted, treat it as available and let the actual
+    install happen at first use. Must stay network-free (runs on every
+    ``hermes tools`` paint and every web_search dispatch).
+    """
+    try:
+        from tools.lazy_deps import LAZY_DEPS, _allow_lazy_installs
+
+        return "search.ddgs" in LAZY_DEPS and _allow_lazy_installs()
+    except Exception as exc:  # noqa: BLE001 — never fatal to availability probe
+        logger.debug("ddgs lazy-installability probe failed: %s", exc)
+        return False
+
 # ─── Firecrawl Client ────────────────────────────────────────────────────────
 
 # ─── Firecrawl Client ────────────────────────────────────────────────────────
@@ -1006,6 +1031,14 @@ def check_web_api_key() -> bool:
     """
     configured = _load_web_config().get("backend", "").lower().strip()
     if configured and _is_backend_available(configured):
+        return True
+    # ddgs is the keyless default backend. When it's the selected backend but
+    # not yet installed, light the tool up anyway if it can be lazy-installed —
+    # the ddgs provider self-installs on first use. Without this a fresh/sealed
+    # image (which never bundles ddgs) reports the default backend unavailable
+    # and web_search never lights up (#60425). Mirrors keyed backends, whose
+    # is_available() returns True on a configured key before the SDK installs.
+    if configured == "ddgs" and _ddgs_lazy_installable():
         return True
     # Any built-in backend with credentials present. This is a boolean OR, so
     # unlike _get_backend() the probe order is irrelevant.

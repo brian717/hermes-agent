@@ -1338,19 +1338,35 @@ def _run_post_setup(post_setup_key: str):
             _print_success("    ddgs is already installed")
         except ImportError:
             _print_info("    Installing ddgs (DuckDuckGo search package)...")
+            # Route through lazy_deps.ensure so the install honors the durable
+            # target on sealed Docker images (a bare venv pip install would
+            # fail there and never redirect) — mirrors the other web backends
+            # (#60425).
             try:
-                result = _pip_install(["-U", "ddgs", "--quiet"], timeout=300)
-                if result.returncode == 0:
-                    _print_success("    ddgs installed")
-                else:
-                    _print_warning("    ddgs install failed:")
-                    _print_info(f"      {(result.stderr or '').strip()[:300]}")
-                    _print_info("    Run manually: uv pip install -U ddgs")
-                    return
-            except subprocess.TimeoutExpired:
-                _print_warning("    ddgs install timed out (>5min)")
+                from tools.lazy_deps import FeatureUnavailable, ensure as _lazy_ensure
+
+                _lazy_ensure("search.ddgs", prompt=False)
+                _print_success("    ddgs installed")
+            except FeatureUnavailable as exc:
+                _print_warning("    ddgs install failed:")
+                _print_info(f"      {str(exc).strip()[:300]}")
                 _print_info("    Run manually: uv pip install -U ddgs")
                 return
+            except Exception as exc:  # noqa: BLE001 — fall back to a direct install
+                _print_info(f"    (lazy install unavailable: {exc}; trying direct pip)")
+                try:
+                    result = _pip_install(["-U", "ddgs", "--quiet"], timeout=300)
+                    if result.returncode == 0:
+                        _print_success("    ddgs installed")
+                    else:
+                        _print_warning("    ddgs install failed:")
+                        _print_info(f"      {(result.stderr or '').strip()[:300]}")
+                        _print_info("    Run manually: uv pip install -U ddgs")
+                        return
+                except subprocess.TimeoutExpired:
+                    _print_warning("    ddgs install timed out (>5min)")
+                    _print_info("    Run manually: uv pip install -U ddgs")
+                    return
         _print_info("    No API key required. DuckDuckGo enforces server-side rate limits.")
         _print_info("    Pair with an extract provider if you also need web_extract.")
 

@@ -49,7 +49,24 @@ def _install_fake_ddgs(monkeypatch, *, text_results=None, text_raises=None, text
 
     fake.DDGS = _FakeDDGS
     monkeypatch.setitem(sys.modules, "ddgs", fake)
+    # The provider now lazy-installs ddgs on first use (#60425). Under test the
+    # injected fake module has no distribution metadata, so the real ensure()
+    # would attempt an actual pip install; neutralize it — presence of the fake
+    # module is what these tests exercise.
+    _neutralize_ddgs_lazy_install(monkeypatch)
     return fake
+
+
+def _neutralize_ddgs_lazy_install(monkeypatch):
+    """Stub lazy-install so tests never shell out to pip.
+
+    The provider imports ``tools.lazy_deps.ensure`` lazily *inside*
+    ``_ensure_ddgs_installed`` at call time, so patching that boundary is
+    robust even when a test re-imports the provider module fresh.
+    """
+    import tools.lazy_deps as _ld
+
+    monkeypatch.setattr(_ld, "ensure", lambda *a, **k: None, raising=True)
 
 
 # ---------------------------------------------------------------------------
@@ -143,6 +160,8 @@ class TestDDGSProviderSearch:
             return orig_import(name, *args, **kwargs)
 
         monkeypatch.setattr(builtins, "__import__", blocked_import)
+        # search() now lazy-installs on first use; keep the test hermetic.
+        _neutralize_ddgs_lazy_install(monkeypatch)
         from plugins.web.ddgs.provider import DDGSWebSearchProvider
 
         result = DDGSWebSearchProvider().search("q", limit=5)
@@ -301,3 +320,121 @@ class TestDDGSSearchOnlyErrors:
         assert result["success"] is False
         assert "search-only" in result["error"].lower()
         assert "duckduckgo" in result["error"].lower() or "ddgs" in result["error"].lower()
+
+
+# ---------------------------------------------------------------------------
+# Lazy-install wiring (#60425): ddgs self-installs on first use like the other
+# web backends, and the tool lights up on a fresh/sealed image where ddgs is
+# the configured (keyless) default but not yet installed.
+# ---------------------------------------------------------------------------
+
+
+class TestDDGSLazyInstall:
+    def test_ddgs_registered_in_lazy_deps(self):
+        """ddgs must be an allowlisted lazy feature so ensure() can install it
+        (and the durable-target redirect applies on sealed images)."""
+        from tools.lazy_deps import LAZY_DEPS
+
+        assert LAZY_DEPS.get("search.ddgs") == ("ddgs==9.14.4",)
+
+    def test_lazy_deps_pin_matches_pyproject_extra(self):
+        """The LAZY_DEPS pin and the pyproject `ddgs` extra must agree so
+        `hermes update` can't downgrade the package below the lazy pin."""
+        import tomllib
+        from pathlib import Path
+
+        from tools.lazy_deps import LAZY_DEPS
+
+        pyproject = tomllib.loads(
+            (Path(__file__).resolve().parents[2] / "pyproject.toml").read_text(encoding="utf-8")
+        )
+        extra = pyproject["project"]["optional-dependencies"]["ddgs"]
+        assert extra == list(LAZY_DEPS["search.ddgs"])
+
+    def test_search_triggers_lazy_install_before_import(self, monkeypatch):
+        """search() must call ensure('search.ddgs') so a missing package
+        self-installs on first use (mirrors exa/firecrawl/parallel)."""
+        calls = []
+
+        import tools.lazy_deps as _ld
+
+        def _fake_ensure(feature, **kwargs):
+            calls.append((feature, kwargs))
+
+        monkeypatch.setattr(_ld, "ensure", _fake_ensure, raising=True)
+        # A working fake package so search() succeeds past the install step.
+        fake = types.ModuleType("ddgs")
+
+        class _FakeDDGS:
+            def __init__(self, **kwargs):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_a):
+                return False
+
+            def text(self, query, max_results=5):
+                return iter(())
+
+        fake.DDGS = _FakeDDGS
+        monkeypatch.setitem(sys.modules, "ddgs", fake)
+
+        from plugins.web.ddgs.provider import DDGSWebSearchProvider
+
+        result = DDGSWebSearchProvider().search("q", limit=5)
+
+        assert result["success"] is True
+        assert ("search.ddgs", {"prompt": False}) in calls
+
+    def test_ensure_helper_swallows_import_error(self, monkeypatch):
+        """_ensure_ddgs_installed must not raise when lazy_deps is unusable —
+        the subsequent `import ddgs` is the real availability gate."""
+        import plugins.web.ddgs.provider as _prov
+        import tools.lazy_deps as _ld
+
+        def _boom(*_a, **_k):
+            raise ImportError("lazy_deps unavailable")
+
+        monkeypatch.setattr(_ld, "ensure", _boom, raising=True)
+        # Should not raise.
+        _prov._ensure_ddgs_installed()
+
+
+class TestDDGSGateLightsUpWhenInstallable:
+    """check_web_api_key must report the keyless ddgs default as available when
+    it can be lazy-installed, even before the package is present (#60425)."""
+
+    def test_configured_ddgs_available_when_lazy_installable(self, monkeypatch):
+        from tools import web_tools
+
+        monkeypatch.setattr(web_tools, "_load_web_config", lambda: {"backend": "ddgs"})
+        monkeypatch.setattr(web_tools, "_ddgs_package_importable", lambda: False)
+        monkeypatch.setattr(web_tools, "_ddgs_lazy_installable", lambda: True)
+        assert web_tools.check_web_api_key() is True
+
+    def test_configured_ddgs_unavailable_when_lazy_disabled(self, monkeypatch):
+        from tools import web_tools
+
+        monkeypatch.setattr(web_tools, "_load_web_config", lambda: {"backend": "ddgs"})
+        monkeypatch.setattr(web_tools, "_ddgs_package_importable", lambda: False)
+        monkeypatch.setattr(web_tools, "_ddgs_lazy_installable", lambda: False)
+        # No other backend configured/credentialed → tool stays dark.
+        for key in ("FIRECRAWL_API_KEY", "FIRECRAWL_API_URL", "PARALLEL_API_KEY",
+                    "TAVILY_API_KEY", "EXA_API_KEY", "SEARXNG_URL", "BRAVE_SEARCH_API_KEY"):
+            monkeypatch.delenv(key, raising=False)
+        monkeypatch.setattr(web_tools, "_is_tool_gateway_ready", lambda: False)
+        assert web_tools.check_web_api_key() is False
+
+    def test_lazy_installable_probe_respects_allow_flag(self, monkeypatch):
+        """_ddgs_lazy_installable reflects the lazy-install kill switch and
+        stays network-free (it must not import ddgs)."""
+        from tools import web_tools
+        import tools.lazy_deps as _ld
+
+        monkeypatch.setattr(_ld, "_allow_lazy_installs", lambda: True)
+        assert web_tools._ddgs_lazy_installable() is True
+
+        monkeypatch.setattr(_ld, "_allow_lazy_installs", lambda: False)
+        assert web_tools._ddgs_lazy_installable() is False

@@ -113,6 +113,15 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     "search.exa": ("exa-py==2.10.2",),
     "search.firecrawl": ("firecrawl-py==4.17.0",),
     "search.parallel": ("parallel-web==0.4.2",),
+    # ddgs is the only web-search backend that needs no API key, and
+    # config.yaml ships web.backend: ddgs as the default. Registering it here
+    # (like exa/firecrawl/parallel) lets it self-install on first use via
+    # ensure() — including the durable-target redirect on sealed Docker images
+    # (HERMES_DISABLE_LAZY_INSTALLS=1 + HERMES_LAZY_INSTALL_TARGET), where a
+    # bare `pip install ddgs` into the sealed venv would fail and the default
+    # web backend would silently report itself unavailable for the life of the
+    # container (#60425).
+    "search.ddgs": ("ddgs==9.14.4",),
 
     # ─── TTS providers ─────────────────────────────────────────────────────
     # Pinned to exact versions to match pyproject.toml's no-ranges policy
