@@ -5036,6 +5036,47 @@ class TestRunConversation:
         assert result["api_calls"] == 2
         assert result["final_response"] == "Done — the config has been updated"
 
+    def test_ollama_cloud_glm_stop_does_not_trigger_heuristic(self, agent):
+        """Issue #60928: Ollama *Cloud* (``ollama.com``) is a hosted,
+        OpenAI-compatible API that reports finish_reason correctly. The bare
+        ``"ollama"`` substring must not misclassify the public cloud host as a
+        local Ollama backend and fire the stop->length continuation workaround.
+
+        A GLM response ending without a terminal boundary must be delivered
+        as-is (no spurious continuation). Only two responses are queued, so a
+        buggy third continuation call would raise ``StopIteration``.
+        """
+        self._setup_agent(agent)
+        agent.base_url = "https://ollama.com/v1"
+        agent._base_url_lower = agent.base_url.lower()
+        agent.provider = "ollama-cloud"
+        agent.model = "glm-5.2"
+
+        tool_turn = _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[_mock_tool_call(name="web_search", arguments="{}", call_id="c1")],
+        )
+        # Ends without ASCII punctuation — would be reclassified as truncated
+        # if the cloud host were (wrongly) treated as local Ollama.
+        normal_stop = _mock_response(
+            content="Based on the search results, the best next",
+            finish_reason="stop",
+        )
+        agent.client.chat.completions.create.side_effect = [tool_turn, normal_stop]
+
+        with (
+            patch("run_agent.handle_function_call", return_value="search result"),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["completed"] is True
+        assert result["api_calls"] == 2
+        assert result["final_response"] == "Based on the search results, the best next"
+
     def test_length_thinking_exhausted_skips_continuation(self, agent):
         """When finish_reason='length' but content is only thinking, skip retries."""
         self._setup_agent(agent)

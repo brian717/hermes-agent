@@ -1482,12 +1482,29 @@ class AIAgent:
         (LiteLLM/sglang/vLLM/LM Studio proxies, Tailscale boxes), which
         report finish_reason correctly and were the source of #13971's
         false-positive truncation continuations.
+
+        It also excludes Ollama *Cloud* (``ollama.com``): that is a hosted,
+        OpenAI-compatible API which reports finish_reason correctly, so the
+        bare ``"ollama"`` substring must not misclassify the public cloud
+        host as a local backend.
         """
         model_lower = (self.model or "").lower()
         provider_lower = (self.provider or "").lower()
         if "glm" not in model_lower and provider_lower != "zai":
             return False
-        if "ollama" in self._base_url_lower or ":11434" in self._base_url_lower:
+        base = self._base_url_lower
+        # Ollama Cloud (ollama.com) is a hosted API that reports finish_reason
+        # correctly — only local/self-hosted Ollama misreports truncation as
+        # stop. Require a local signature (default port / loopback) or an
+        # explicit provider before treating the cloud host as a local backend.
+        if "ollama.com" in base:
+            return (
+                ":11434" in base
+                or "localhost" in base
+                or "127.0.0.1" in base
+                or provider_lower == "ollama"
+            )
+        if "ollama" in base or ":11434" in base:
             return True
         return provider_lower == "ollama"
 
