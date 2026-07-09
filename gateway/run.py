@@ -20257,6 +20257,47 @@ async def _await_thread_exit(
     return not thread.is_alive()
 
 
+def _resolve_stderr_log_level(verbosity: Optional[int], stream=None) -> int:
+    """Resolve the level for the gateway's stderr :class:`~logging.StreamHandler`.
+
+    The base level follows the ``-v``/``-q`` verbosity flags (``0`` → WARNING,
+    ``1`` → INFO, ``2+`` → DEBUG). When stderr is **not** a TTY — the standard
+    case under launchd/systemd, where it is redirected to a never-rotated
+    ``StandardErrorPath`` file — WARNING+ records are already captured by the
+    rotating ``errors.log`` handler, so mirroring them onto stderr merely grows
+    that service-manager file without bound (#61589). In that case the floor is
+    raised to CRITICAL, leaving stderr for the pre-logging crash output
+    (interpreter tracebacks, startup failures) that ``StandardErrorPath`` exists
+    to capture. Interactive/foreground runs keep today's behavior.
+
+    ``HERMES_STDERR_LOG_LEVEL`` (a level name like ``WARNING`` or a numeric
+    level) overrides the resolution entirely, for operators who deliberately
+    want the verbose stream captured under a redirect.
+    """
+    base = {0: logging.WARNING, 1: logging.INFO}.get(verbosity, logging.DEBUG)
+
+    override = os.environ.get("HERMES_STDERR_LOG_LEVEL")
+    if override and override.strip():
+        token = override.strip()
+        named = logging.getLevelName(token.upper())
+        if isinstance(named, int):
+            return named
+        try:
+            return int(token)
+        except ValueError:
+            # Unrecognized override — fall through to auto-detection.
+            pass
+
+    if stream is None:
+        stream = sys.stderr
+    try:
+        interactive = bool(stream.isatty())
+    except Exception:
+        interactive = False
+
+    return base if interactive else max(base, logging.CRITICAL)
+
+
 async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = False, verbosity: Optional[int] = 0) -> bool:
     """
     Start the gateway and run until interrupted.
@@ -20447,14 +20488,18 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
 
     # Optional stderr handler — level driven by -v/-q flags on the CLI.
     # verbosity=None (-q/--quiet): no stderr output
-    # verbosity=0    (default):    WARNING and above
-    # verbosity=1    (-v):         INFO and above
-    # verbosity=2+   (-vv/-vvv):   DEBUG
+    # verbosity=0    (default):    WARNING and above (interactive) / CRITICAL (redirected)
+    # verbosity=1    (-v):         INFO and above (interactive) / CRITICAL (redirected)
+    # verbosity=2+   (-vv/-vvv):   DEBUG (interactive) / CRITICAL (redirected)
+    # Under launchd/systemd stderr is redirected to a never-rotated file, so we
+    # raise the floor to CRITICAL there to avoid unbounded duplicate growth
+    # (#61589); see _resolve_stderr_log_level for the full rationale.
     if verbosity is not None:
         from agent.redact import RedactingFormatter
 
-        _stderr_level = {0: logging.WARNING, 1: logging.INFO}.get(verbosity, logging.DEBUG)
-        _stderr_handler = logging.StreamHandler(_safe_stderr())
+        _stderr_stream = _safe_stderr()
+        _stderr_level = _resolve_stderr_log_level(verbosity, _stderr_stream)
+        _stderr_handler = logging.StreamHandler(_stderr_stream)
         _stderr_handler.setLevel(_stderr_level)
         _stderr_handler.setFormatter(RedactingFormatter('%(levelname)s %(name)s: %(message)s'))
         logging.getLogger().addHandler(_stderr_handler)
