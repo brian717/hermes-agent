@@ -3779,6 +3779,13 @@ def _save_custom_provider(
             if model and entry.get("model") != model:
                 entry["model"] = model
                 changed = True
+            # Refresh a rotated key: without this the dedup branch left the old
+            # api_key in config.yaml even after the user updated it in the UI, so
+            # the stale key kept being sent (#62269). Only overwrite on a real,
+            # different value — an empty api_key means "unchanged", not "clear".
+            if api_key and entry.get("api_key") != api_key:
+                entry["api_key"] = api_key
+                changed = True
             if model and context_length:
                 models_cfg = entry.get("models", {})
                 if not isinstance(models_cfg, dict):

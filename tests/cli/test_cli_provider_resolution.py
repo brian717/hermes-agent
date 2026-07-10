@@ -882,3 +882,37 @@ def test_save_custom_provider_uses_provided_name(monkeypatch, tmp_path):
     entries = saved.get("custom_providers", [])
     assert len(entries) == 1
     assert entries[0]["name"] == "Ollama"
+
+
+def test_save_custom_provider_updates_api_key_on_resave(monkeypatch, tmp_path):
+    """Re-saving the same base_url with a new key must refresh the stored key.
+
+    Regression for #62269: updating a custom OpenAI-compatible provider's API
+    key in the UI wrote the new key to .env but the dedup-by-base_url branch of
+    ``_save_custom_provider`` left the old ``api_key`` in config.yaml, so the
+    stale key kept being sent (HTTP 401). The saved entry must reflect the
+    latest key.
+    """
+    import yaml
+    from hermes_cli.main import _save_custom_provider
+
+    cfg_path = tmp_path / "config.yaml"
+    cfg_path.write_text(yaml.dump({}))
+
+    # Round-trip load/save through the file so the second call sees the first.
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: yaml.safe_load(cfg_path.read_text()) or {},
+    )
+    monkeypatch.setattr(
+        "hermes_cli.config.save_config",
+        lambda cfg: cfg_path.write_text(yaml.dump(cfg)),
+    )
+
+    base_url = "https://api.example.com/v1"
+    _save_custom_provider(base_url, api_key="sk-old-key", model="gpt-4o", name="Example")
+    _save_custom_provider(base_url, api_key="sk-new-key", model="gpt-4o", name="Example")
+
+    entries = (yaml.safe_load(cfg_path.read_text()) or {}).get("custom_providers", [])
+    assert len(entries) == 1, "must dedup by base_url, not append a second entry"
+    assert entries[0]["api_key"] == "sk-new-key"
