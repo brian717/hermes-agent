@@ -805,6 +805,127 @@ class TestSendDocument:
         assert result.message_id == "fallback"
 
     @pytest.mark.asyncio
+    async def test_send_document_retries_never_sent_transient_error(
+        self, connected_adapter, tmp_path, monkeypatch
+    ):
+        """A pool/connect-timeout (proven never sent) is retried, not degraded (#62079).
+
+        A single transient upload blip used to fall straight through to the base
+        adapter's generic "Couldn't deliver the file attachment." warning even
+        for a valid, locally-verified file. Because the error proves the request
+        never reached Telegram, re-sending is safe and should recover.
+        """
+        # Avoid real backoff sleeps.
+        monkeypatch.setattr(
+            "plugins.platforms.telegram.adapter.asyncio.sleep", AsyncMock()
+        )
+        test_file = tmp_path / "package.zip"
+        test_file.write_bytes(b"PK\x03\x04 fake zip payload")
+
+        class _PoolTimeout(Exception):
+            pass
+
+        mock_msg = MagicMock()
+        mock_msg.message_id = 321
+        # Fail once with a never-sent transient error, then succeed.
+        connected_adapter._bot.send_document = AsyncMock(
+            side_effect=[
+                _PoolTimeout(
+                    "Pool timeout: All connections in the connection pool are "
+                    "occupied. Request was *not* sent to Telegram."
+                ),
+                mock_msg,
+            ]
+        )
+        # If the retry path silently fell back to base, this would flip success.
+        connected_adapter.send = AsyncMock(
+            return_value=SendResult(success=False, error="fallback")
+        )
+
+        result = await connected_adapter.send_document(
+            chat_id="12345",
+            file_path=str(test_file),
+        )
+
+        assert result.success is True
+        assert result.message_id == "321"
+        assert connected_adapter._bot.send_document.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_send_document_does_not_retry_generic_error(
+        self, connected_adapter, tmp_path, monkeypatch
+    ):
+        """A generic (possibly-sent) error is NOT retried — no duplicate-upload risk.
+
+        Only errors proven never to have reached Telegram are retried; anything
+        else preserves the existing single-attempt + base-fallback behavior.
+        """
+        sleep_mock = AsyncMock()
+        monkeypatch.setattr(
+            "plugins.platforms.telegram.adapter.asyncio.sleep", sleep_mock
+        )
+        test_file = tmp_path / "file.pdf"
+        test_file.write_bytes(b"%PDF-1.4 data")
+
+        connected_adapter._bot.send_document = AsyncMock(
+            side_effect=RuntimeError("Telegram API error")
+        )
+        connected_adapter.send = AsyncMock(
+            return_value=SendResult(success=True, message_id="fallback")
+        )
+
+        result = await connected_adapter.send_document(
+            chat_id="12345",
+            file_path=str(test_file),
+        )
+
+        # Fell back to base after a single attempt; no retry, no backoff sleep.
+        assert result.success is True
+        assert result.message_id == "fallback"
+        assert connected_adapter._bot.send_document.await_count == 1
+        sleep_mock.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_send_document_reopens_stream_between_transient_retries(
+        self, connected_adapter, tmp_path, monkeypatch
+    ):
+        """Each retry rewinds the file handle so the re-upload sends full bytes."""
+        monkeypatch.setattr(
+            "plugins.platforms.telegram.adapter.asyncio.sleep", AsyncMock()
+        )
+        test_file = tmp_path / "clip.zip"
+        payload = b"PK\x03\x04" + b"content-bytes" * 8
+        test_file.write_bytes(payload)
+
+        class _PoolTimeout(Exception):
+            pass
+
+        seen_offsets = []
+
+        async def _capture(*args, **kwargs):
+            # Read what the uploader would send this attempt.
+            doc = kwargs["document"]
+            seen_offsets.append(doc.tell())
+            data = doc.read()
+            if len(seen_offsets) == 1:
+                raise _PoolTimeout("connection pool ... occupied; not sent")
+            assert data == payload
+            m = MagicMock()
+            m.message_id = 500
+            return m
+
+        connected_adapter._bot.send_document = AsyncMock(side_effect=_capture)
+
+        result = await connected_adapter.send_document(
+            chat_id="12345",
+            file_path=str(test_file),
+        )
+
+        assert result.success is True
+        # Both attempts started reading from the beginning of the file.
+        assert seen_offsets == [0, 0]
+
+    @pytest.mark.asyncio
     async def test_send_document_reply_to(self, connected_adapter, tmp_path):
         """reply_to parameter is forwarded as reply_to_message_id."""
         test_file = tmp_path / "spec.md"

@@ -451,6 +451,15 @@ class TelegramAdapter(BasePlatformAdapter):
     MEDIA_GROUP_WAIT_SECONDS = 0.8
     _GENERAL_TOPIC_THREAD_ID = "1"
 
+    # Bounded retry for outbound media uploads (send_document/send_video) that
+    # fail with a transient error the transport proves never reached Telegram
+    # (pool/connect timeouts).  Without this a single transient blip degrades a
+    # valid, locally-verified attachment to the generic "Couldn't deliver the
+    # file attachment." warning with no recovery (#62079).  Only never-sent
+    # errors are retried, so re-sending cannot duplicate the upload.
+    _MEDIA_SEND_TRANSIENT_ATTEMPTS = 3
+    _MEDIA_SEND_TRANSIENT_BACKOFF_SECONDS = 0.5
+
     # Telegram's edit_message applies MarkdownV2 formatting only on the
     # finalize=True path.  Without this flag, stream_consumer._send_or_edit
     # short-circuits when the raw text is unchanged between the last streamed
@@ -1123,7 +1132,68 @@ class TelegramAdapter(BasePlatformAdapter):
                 return True
         return False
 
+    def _is_never_sent_transient_error(self, error: Exception) -> bool:
+        """Return True for transient errors the transport proves never reached Telegram.
+
+        Pool timeouts and connect timeouts are raised before/without the request
+        leaving the process, so re-sending is safe and cannot duplicate. Other
+        transient errors (a plain ``TimedOut`` or an ``httpx.ReadError`` while
+        reading the response) may mean Telegram already received the upload, so
+        they are deliberately *not* treated as safe to retry here.
+        """
+        return self._looks_like_pool_timeout(error) or self._looks_like_connect_timeout(error)
+
     async def _send_with_dm_topic_reply_anchor_retry(
+        self,
+        send_fn: Any,
+        send_kwargs: Dict[str, Any],
+        metadata: Optional[Dict[str, Any]],
+        reply_to_message_id: Optional[int],
+        media_label: str,
+        reset_media: Optional[Any] = None,
+        retry_transient: bool = False,
+    ) -> Any:
+        """Send with a stale private-topic reply-anchor retry.
+
+        When ``retry_transient`` is set (media uploads), also retry a bounded
+        number of times on transient errors the transport proves never reached
+        Telegram, reopening the media stream between attempts (#62079).
+        """
+        max_attempts = self._MEDIA_SEND_TRANSIENT_ATTEMPTS if retry_transient else 1
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                return await self._send_once_with_dm_topic_reply_anchor_retry(
+                    send_fn,
+                    send_kwargs,
+                    metadata,
+                    reply_to_message_id,
+                    media_label,
+                    reset_media,
+                )
+            except Exception as send_err:
+                if (
+                    attempt >= max_attempts
+                    or not self._is_never_sent_transient_error(send_err)
+                ):
+                    raise
+                delay = self._MEDIA_SEND_TRANSIENT_BACKOFF_SECONDS * (2 ** (attempt - 1))
+                logger.warning(
+                    "[%s] Transient send error for Telegram %s "
+                    "(attempt %d/%d), retrying in %.1fs: %s",
+                    self.name,
+                    media_label,
+                    attempt,
+                    max_attempts,
+                    delay,
+                    _redact_telegram_error_text(send_err),
+                )
+                if reset_media is not None:
+                    reset_media()
+                await asyncio.sleep(delay)
+
+    async def _send_once_with_dm_topic_reply_anchor_retry(
         self,
         send_fn: Any,
         send_kwargs: Dict[str, Any],
@@ -6179,6 +6249,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     reply_to_id,
                     "document",
                     reset_media=lambda: f.seek(0),
+                    retry_transient=True,
                 )
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as e:
@@ -6229,6 +6300,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     reply_to_id,
                     "video",
                     reset_media=lambda: f.seek(0),
+                    retry_transient=True,
                 )
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as e:
