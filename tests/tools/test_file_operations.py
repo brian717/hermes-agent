@@ -886,3 +886,82 @@ class _DeletedTestGitBaselineCheck:
     helper is restored or replaced.
     """
     pass
+
+
+# =========================================================================
+# Windows: native rg.exe must get the drive-qualified path, not MSYS /c/...
+# (regression test for #63177 — search_files silently returns 0 results on
+# Windows when passed an absolute path)
+# =========================================================================
+
+import tools.environments.local as _local_mod
+
+
+class TestRgNativePathWindows:
+    """On Windows, Hermes sets MSYS_NO_PATHCONV=1 in bash subprocesses, so
+    native ``rg.exe`` must receive ``C:/Users/x`` — NOT the MSYS ``/c/Users/x``
+    form that ``_escape_shell_arg`` produces for MSYS builtins. Otherwise rg
+    resolves ``/c/...`` against the cwd drive and the search silently returns
+    zero results. These tests fake the Windows env on Linux CI by patching
+    ``_IS_WINDOWS`` so the msys translation is exercised deterministically.
+    """
+
+    WIN_PATH = "C:/Users/testuser/Documents/Obsidian Vault"
+    MSYS_PATH = "/c/Users/testuser/Documents/Obsidian Vault"
+
+    def _capture_env(self):
+        env = MagicMock()
+        env.cwd = "/tmp/test"
+        commands = []
+
+        def execute(command, **kwargs):
+            commands.append(command)
+            return {"output": "", "returncode": 0}
+
+        env.execute.side_effect = execute
+        return env, commands
+
+    def test_escape_native_keeps_drive_path_when_msys_would_rewrite(self, monkeypatch):
+        monkeypatch.setattr(_local_mod, "_IS_WINDOWS", True)
+        ops = ShellFileOperations(MagicMock())
+        # Sanity: the MSYS escaper rewrites the drive path (correct for builtins)...
+        assert ops._escape_shell_arg(self.WIN_PATH) == f"'{self.MSYS_PATH}'"
+        # ...but the native escaper must leave it drive-qualified for rg.exe.
+        assert ops._escape_shell_arg_native(self.WIN_PATH) == f"'{self.WIN_PATH}'"
+
+    def test_search_files_rg_uses_native_path(self, monkeypatch):
+        monkeypatch.setattr(_local_mod, "_IS_WINDOWS", True)
+        env, commands = self._capture_env()
+        ops = ShellFileOperations(env)
+
+        ops._search_files_rg("*.md", self.WIN_PATH, limit=50, offset=0)
+
+        assert commands, "expected rg command to be executed"
+        for cmd in commands:
+            assert cmd.startswith("rg --files"), cmd
+            assert self.WIN_PATH in cmd, cmd
+            # The MSYS form would make rg.exe resolve against the wrong drive.
+            assert self.MSYS_PATH not in cmd, cmd
+
+    def test_search_with_rg_uses_native_path(self, monkeypatch):
+        monkeypatch.setattr(_local_mod, "_IS_WINDOWS", True)
+        env, commands = self._capture_env()
+        ops = ShellFileOperations(env)
+
+        ops._search_with_rg(
+            "TODO", self.WIN_PATH, file_glob="*.py",
+            limit=50, offset=0, output_mode="content", context=0,
+        )
+
+        assert commands, "expected rg command to be executed"
+        rg_cmd = commands[-1]
+        assert " rg " in f" {rg_cmd} ", rg_cmd
+        assert self.WIN_PATH in rg_cmd, rg_cmd
+        assert self.MSYS_PATH not in rg_cmd, rg_cmd
+
+    def test_native_escaper_is_noop_off_windows(self, monkeypatch):
+        # Off Windows the translator is already a no-op, so both escapers agree.
+        monkeypatch.setattr(_local_mod, "_IS_WINDOWS", False)
+        ops = ShellFileOperations(MagicMock())
+        assert ops._escape_shell_arg_native("/home/u/x") == "'/home/u/x'"
+        assert ops._escape_shell_arg_native("/home/u/x") == ops._escape_shell_arg("/home/u/x")
