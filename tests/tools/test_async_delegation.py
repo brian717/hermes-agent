@@ -234,6 +234,35 @@ def test_completion_is_persisted_and_delivery_can_be_acknowledged(tmp_path, monk
     assert ad.get_durable_delegation(dispatched["delegation_id"])["delivery_state"] == "delivered"
 
 
+def test_restore_undelivered_completions_marks_events_restored(tmp_path, monkeypatch):
+    """Restored events carry an in-memory ``restored=True`` marker so an
+    unfiltered drain can fail closed instead of leaking them (#64484). The
+    on-disk ``event_json`` is left untouched (the marker is added to the
+    enqueued dict only)."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    dispatched = ad.dispatch_async_delegation(
+        goal="durable", context=None, toolsets=None, role="leaf",
+        model="m", session_key="owner", parent_session_id="parent",
+        runner=lambda: {"status": "completed", "summary": "survived"},
+    )
+    assert _drain_one() is not None
+
+    restored = queue.Queue()
+    assert ad.restore_undelivered_completions(restored) == 1
+    evt = restored.get_nowait()
+    assert evt["restored"] is True
+    assert evt["delegation_id"] == dispatched["delegation_id"]
+
+    # The persisted event payload must not gain the transient marker — it is
+    # added to the enqueued dict only, so a later restore re-derives it fresh.
+    with ad._DB_LOCK, ad._connect() as conn:
+        stored_json = conn.execute(
+            "SELECT event_json FROM async_delegations WHERE delegation_id=?",
+            (dispatched["delegation_id"],),
+        ).fetchone()[0]
+    assert "restored" not in json.loads(stored_json)
+
+
 def test_real_process_restart_restores_owned_completion_once(tmp_path):
     """Real-import E2E: a fresh interpreter restores a prior process's result."""
     repo = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))

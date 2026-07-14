@@ -1211,6 +1211,19 @@ class ProcessRegistry:
                     if evt_session_key != session_key:
                         requeue.append(evt)
                         continue
+                elif evt.get("restored"):
+                    # No positive ownership proof (owns_event/session_key both
+                    # absent) AND this event was rehydrated from disk at process
+                    # startup, so it predates this process and may belong to a
+                    # dead, unrelated session. The legacy consume-everything
+                    # branch below is only safe for events *this* live process
+                    # created; consuming a restored one leaks another session's
+                    # conversation payload into this one (#64484). Fail closed:
+                    # requeue so only a positively-owning drain (TUI ownership
+                    # callback) or the owner's --resume lineage can claim it,
+                    # while it stays pending on disk.
+                    requeue.append(evt)
+                    continue
             text = format_process_notification(evt)
             if text:
                 results.append((evt, text))

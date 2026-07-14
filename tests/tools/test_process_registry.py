@@ -1449,6 +1449,101 @@ def test_drain_notifications_no_filter_passes_all_async_delegation():
             process_registry.completion_queue.get_nowait()
 
 
+def test_drain_notifications_unfiltered_requeues_restored_async_delegation():
+    """A rehydrated (restored=True) completion must NOT be consumed by an
+    unfiltered drain — the CLI's idle/post-turn drain sites hit exactly this
+    legacy branch, and durable restore (#63494) enqueues every pending row
+    regardless of origin session. Consuming one would inject a dead, unrelated
+    session's conversation into a fresh session (#64484). Fail closed: requeue.
+    """
+    from tools.process_registry import process_registry
+
+    while not process_registry.completion_queue.empty():
+        process_registry.completion_queue.get_nowait()
+
+    try:
+        # Foreign session's completion, rehydrated from disk at startup.
+        process_registry.completion_queue.put({
+            "type": "async_delegation",
+            "delegation_id": "deleg_foreign_restored",
+            "session_key": "OLD_SESSION_A",
+            "goal": "task", "status": "completed", "summary": "SECRET payload",
+            "api_calls": 1, "duration_seconds": 0.1,
+            "restored": True,
+        })
+
+        # Bare unfiltered drain (mirrors cli.py post-turn drain_notifications()).
+        results = process_registry.drain_notifications()
+        assert results == [], (
+            "Restored async-delegation event leaked through the unfiltered drain"
+        )
+
+        # It stays pending on the queue for a positively-owning drain / --resume.
+        leftover = process_registry.completion_queue.get_nowait()
+        assert leftover["delegation_id"] == "deleg_foreign_restored"
+    finally:
+        while not process_registry.completion_queue.empty():
+            process_registry.completion_queue.get_nowait()
+
+
+def test_drain_notifications_unfiltered_still_consumes_live_async_delegation():
+    """The fail-closed guard is scoped to restored events only: a live event
+    created by THIS process (no ``restored`` marker) still flows through the
+    legacy unfiltered branch, preserving same-process CLI delivery of the
+    process's own keyless (session_key="") dispatches.
+    """
+    from tools.process_registry import process_registry
+
+    while not process_registry.completion_queue.empty():
+        process_registry.completion_queue.get_nowait()
+
+    try:
+        process_registry.completion_queue.put({
+            "type": "async_delegation",
+            "delegation_id": "deleg_live_cli",
+            "session_key": "",  # CLI dispatches are keyless
+            "goal": "task", "status": "completed", "summary": "mine",
+            "api_calls": 1, "duration_seconds": 0.1,
+        })
+
+        results = process_registry.drain_notifications()
+        assert [r[0]["delegation_id"] for r in results] == ["deleg_live_cli"]
+        assert process_registry.completion_queue.empty()
+    finally:
+        while not process_registry.completion_queue.empty():
+            process_registry.completion_queue.get_nowait()
+
+
+def test_drain_notifications_owner_key_still_claims_restored_event():
+    """A positively-owning drain (matching session_key) still consumes its own
+    restored completion — the guard only blocks the *unfiltered* branch, so the
+    owner reclaiming via a keyed drain is unaffected.
+    """
+    from tools.process_registry import process_registry
+
+    while not process_registry.completion_queue.empty():
+        process_registry.completion_queue.get_nowait()
+
+    try:
+        process_registry.completion_queue.put({
+            "type": "async_delegation",
+            "delegation_id": "deleg_owner_restored",
+            "session_key": "telegram:dm:111:user_a",
+            "goal": "task", "status": "completed", "summary": "done",
+            "api_calls": 1, "duration_seconds": 0.1,
+            "restored": True,
+        })
+
+        results = process_registry.drain_notifications(
+            session_key="telegram:dm:111:user_a"
+        )
+        assert [r[0]["delegation_id"] for r in results] == ["deleg_owner_restored"]
+        assert process_registry.completion_queue.empty()
+    finally:
+        while not process_registry.completion_queue.empty():
+            process_registry.completion_queue.get_nowait()
+
+
 def test_drain_notifications_owns_event_callback_beats_key_equality():
     """The positive-proof ownership callback consumes ONLY approved events —
     including across a compression rotation where bare key equality would

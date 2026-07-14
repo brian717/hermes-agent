@@ -264,7 +264,17 @@ def recover_abandoned_delegations() -> int:
 
 
 def restore_undelivered_completions(target_queue) -> int:
-    """Enqueue durable pending completions as fresh turns after process start."""
+    """Enqueue durable pending completions as fresh turns after process start.
+
+    Each restored event is tagged in-memory with ``restored=True`` (never
+    persisted — ``event_json`` on disk is untouched). Because durability
+    (#63494) means a fresh process inherits *every* pending row regardless of
+    which session dispatched it, an unfiltered drain must not consume these
+    blindly or it delivers a dead, unrelated session's conversation into the
+    new session (#64484). The marker lets ``drain_notifications`` fail closed
+    on the legacy consume-everything branch, requeuing restored events for a
+    positively-owning drain / the owner's ``--resume`` instead.
+    """
     recover_abandoned_delegations()
     with _DB_LOCK, _connect() as conn:
         rows = conn.execute(
@@ -273,7 +283,9 @@ def restore_undelivered_completions(target_queue) -> int:
                ORDER BY completed_at, delegation_id"""
         ).fetchall()
         for _delegation_id, payload in rows:
-            target_queue.put(json.loads(payload))
+            evt = json.loads(payload)
+            evt["restored"] = True
+            target_queue.put(evt)
     return len(rows)
 
 
