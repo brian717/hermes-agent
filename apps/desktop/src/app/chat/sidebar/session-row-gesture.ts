@@ -3,9 +3,10 @@
 // component) so the precedence — the part that's easy to get subtly wrong —
 // is unit-testable without rendering the whole sidebar.
 
-export type SessionRowClickAction = 'archive' | 'newWindow' | 'pin' | 'resume'
+export type SessionRowClickAction = 'archive' | 'newTab' | 'newWindow' | 'pin' | 'resume'
 
 export interface SessionRowClickModifiers {
+  altKey: boolean
   ctrlKey: boolean
   metaKey: boolean
   shiftKey: boolean
@@ -14,31 +15,35 @@ export interface SessionRowClickModifiers {
 /**
  * Resolve the click action from its modifiers.
  *
- * Precedence matters: the combined ⌘/⌃+⇧ archive gesture MUST be checked
- * before the single-modifier pin (⇧) and new-window (⌘/⌃) gestures, because
- * it sets all of those flags at once — testing `shiftKey` first would swallow
- * it into "pin".
+ * Precedence matters: the multi-modifier gestures (⌥+⇧ archive, ⌘/⌃+⇧ new
+ * window) MUST be checked before the single-modifier pin (⇧) and new-tab
+ * (⌘/⌃) gestures, because they set those flags too — testing `shiftKey`
+ * first would swallow both into "pin".
  *
  * Archive is independent of window support (it works in the web embed too);
- * only the new-window gesture falls back to a plain resume when standalone
- * windows aren't available.
+ * only the new-window gesture needs standalone windows, and without them
+ * ⌘/⌃+⇧ falls through to the plain ⌘/⌃ new-tab behaviour.
  */
 export function resolveSessionRowClick(
-  { ctrlKey, metaKey, shiftKey }: SessionRowClickModifiers,
+  { altKey, ctrlKey, metaKey, shiftKey }: SessionRowClickModifiers,
   opts: { canOpenWindow: boolean }
 ): SessionRowClickAction {
   const primaryModifier = metaKey || ctrlKey
 
-  if (primaryModifier && shiftKey) {
+  if (altKey && shiftKey) {
     return 'archive'
+  }
+
+  if (primaryModifier && shiftKey && opts.canOpenWindow) {
+    return 'newWindow'
+  }
+
+  if (primaryModifier) {
+    return 'newTab'
   }
 
   if (shiftKey) {
     return 'pin'
-  }
-
-  if (primaryModifier && opts.canOpenWindow) {
-    return 'newWindow'
   }
 
   return 'resume'
