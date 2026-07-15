@@ -2932,6 +2932,54 @@ class SessionDB:
 
         return self._execute_write(_do) or 0
 
+    def finalize_orphaned_tui_sessions(self, cutoff_seconds: float = 604800) -> int:
+        """Mark orphaned TUI/subagent sessions as ended at startup.
+
+        The tui_gateway finalizes a transport-detached session via
+        ``ws_orphan_reap``, scheduled on an in-process ``threading.Timer``.
+        If the gateway process restarts or crashes before that timer fires
+        — which happens on every ``hermes update`` / deploy and on any crash
+        — the timer dies with the process and the session row is left with
+        ``ended_at IS NULL`` permanently: no later code path revisits it, so
+        the row surfaces as phantom "active" work in every
+        ``WHERE ended_at IS NULL`` query (dashboards, peer-recovery paths).
+
+        This is the startup counterpart every other resource type already has
+        (docker/terminal/browser/mcp/cron all reap leftovers at next startup;
+        TUI/subagent sessions were the gap — #65194). It finalizes
+        tui_gateway-owned rows (``source`` in tui/desktop/subagent) that are
+        still open and older than ``cutoff_seconds``. Gateway/plugin and CLI
+        rows have their own lifecycle handling and are deliberately excluded.
+
+        The generous default cutoff (7 days, matching
+        ``finalize_orphaned_compression_sessions``) keeps the sweep from
+        racing a durable session another live backend still owns (see #65059):
+        anything still open after that window is unambiguously stranded.
+        Non-destructive — preserves all messages and stamps
+        ``end_reason='ws_orphan_reap'``, the same reason the live timer would
+        have set, so peer-recovery paths keep treating the row as recoverable.
+        Idempotent, so it is safe to run on every startup.
+        """
+        cutoff = time.time() - max(0.0, cutoff_seconds)
+
+        def _do(conn):
+            now = time.time()
+            result = conn.execute(
+                """
+                UPDATE sessions
+                SET ended_at = ?,
+                    end_reason = 'ws_orphan_reap'
+                WHERE end_reason IS NULL
+                  AND ended_at IS NULL
+                  AND started_at < ?
+                  AND source IN ('tui', 'desktop', 'subagent')
+                """,
+                (now, cutoff),
+            )
+            return result.rowcount
+
+        return self._execute_write(_do) or 0
+
     def get_session(self, session_id: str) -> Optional[Dict[str, Any]]:
         """Get a session by ID."""
         with self._lock:

@@ -629,3 +629,102 @@ class TestFinalizeOrphanedCompressionSessions:
 
         session = db.get_session("titled-ghost")
         assert session["end_reason"] == "orphaned_compression"
+
+
+# ===========================================================================
+# Bug #65194: no startup sweep for orphaned TUI/subagent sessions
+# ===========================================================================
+
+class TestFinalizeOrphanedTuiSessions:
+    """The tui_gateway's ``ws_orphan_reap`` runs in an in-process
+    ``threading.Timer``. If the gateway restarts/crashes before the timer
+    fires, the timer dies with the process and the session row is left with
+    ``ended_at IS NULL`` forever. ``finalize_orphaned_tui_sessions`` is the
+    startup sweep that finalizes those stranded rows (#65194)."""
+
+    def _make_old(self, db, sid, age_seconds=800000):
+        """Backdate a session's started_at so the cutoff applies."""
+        db._execute_write(
+            lambda conn: conn.execute(
+                "UPDATE sessions SET started_at = ? WHERE id = ?",
+                (time.time() - age_seconds, sid),
+            )
+        )
+
+    def test_finalizes_stranded_tui_session(self, tmp_path):
+        """An old, never-finalized ``source='tui'`` row is finalized with the
+        same end_reason the live timer would have set."""
+        db = _make_session_db(tmp_path)
+
+        db.create_session(session_id="orphan-tui", source="tui", model="test")
+        db.append_message("orphan-tui", role="user", content="hello")
+        self._make_old(db, "orphan-tui")
+
+        count = db.finalize_orphaned_tui_sessions()
+        assert count == 1
+
+        session = db.get_session("orphan-tui")
+        assert session["ended_at"] is not None
+        assert session["end_reason"] == "ws_orphan_reap"
+
+    def test_finalizes_desktop_and_subagent_sources(self, tmp_path):
+        """Desktop chat-panel and subagent rows go through the same reaper."""
+        db = _make_session_db(tmp_path)
+
+        for sid, source in (("orphan-desktop", "desktop"), ("orphan-sub", "subagent")):
+            db.create_session(session_id=sid, source=source, model="test")
+            self._make_old(db, sid)
+
+        count = db.finalize_orphaned_tui_sessions()
+        assert count == 2
+        assert db.get_session("orphan-desktop")["end_reason"] == "ws_orphan_reap"
+        assert db.get_session("orphan-sub")["end_reason"] == "ws_orphan_reap"
+
+    def test_skips_recent_sessions(self, tmp_path):
+        """A session younger than the cutoff may still be live in another
+        backend, so it is left untouched."""
+        db = _make_session_db(tmp_path)
+
+        db.create_session(session_id="recent-tui", source="tui", model="test")
+        db.append_message("recent-tui", role="user", content="hi")
+        # started_at is now() — within the cutoff.
+
+        count = db.finalize_orphaned_tui_sessions()
+        assert count == 0
+        assert db.get_session("recent-tui")["ended_at"] is None
+
+    def test_skips_already_finalized_sessions(self, tmp_path):
+        """A row that already has an end_reason keeps it (first reason wins)."""
+        db = _make_session_db(tmp_path)
+
+        db.create_session(session_id="ended-tui", source="tui", model="test")
+        db.end_session("ended-tui", "session_close")
+        self._make_old(db, "ended-tui")
+
+        count = db.finalize_orphaned_tui_sessions()
+        assert count == 0
+        assert db.get_session("ended-tui")["end_reason"] == "session_close"
+
+    def test_skips_gateway_and_cli_sources(self, tmp_path):
+        """Gateway/plugin and CLI rows have their own lifecycle handling and
+        must not be swept by the TUI reaper."""
+        db = _make_session_db(tmp_path)
+
+        for sid, source in (("gw", "telegram"), ("plain-cli", "cli"), ("cron-job", "cron")):
+            db.create_session(session_id=sid, source=source, model="test")
+            self._make_old(db, sid)
+
+        count = db.finalize_orphaned_tui_sessions()
+        assert count == 0
+        for sid in ("gw", "plain-cli", "cron-job"):
+            assert db.get_session(sid)["ended_at"] is None
+
+    def test_idempotent_across_repeated_startups(self, tmp_path):
+        """Safe to run on every startup: a second sweep finds nothing new."""
+        db = _make_session_db(tmp_path)
+
+        db.create_session(session_id="orphan-tui", source="tui", model="test")
+        self._make_old(db, "orphan-tui")
+
+        assert db.finalize_orphaned_tui_sessions() == 1
+        assert db.finalize_orphaned_tui_sessions() == 0

@@ -1808,6 +1808,19 @@ def _run_state_db_auto_maintenance(session_db) -> None:
         except Exception as _finalize_exc:
             logger.debug("Orphan compression finalize skipped: %s", _finalize_exc)
 
+        # Sweep TUI/subagent sessions stranded by a ws_orphan_reap timer that
+        # died with a restarting/crashing gateway (#65194). Unlike the one-time
+        # migrations above this runs every startup, because new orphans are
+        # produced on every restart; the sweep is idempotent and cheap.
+        try:
+            swept = session_db.finalize_orphaned_tui_sessions()
+            if swept:
+                logger.info(
+                    "Finalized %d orphaned TUI/subagent sessions at startup", swept
+                )
+        except Exception as _tui_sweep_exc:
+            logger.debug("Orphan TUI session sweep skipped: %s", _tui_sweep_exc)
+
         cfg = (_load_full_config().get("sessions") or {})
         if not cfg.get("auto_prune", False):
             return
