@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import fs from 'node:fs'
 
 import { test } from 'vitest'
 
@@ -8,6 +9,18 @@ import {
   powershellCandidates,
   readWslWindowsClipboardImage
 } from './wsl-clipboard-image'
+import { PS_SCRIPT } from './wsl-clipboard-script'
+
+function sourceOf(fileName: string) {
+  return fs.readFileSync(new URL(fileName, import.meta.url), 'utf8')
+}
+
+// Bitdefender quarantines any single file carrying both the inline PowerShell
+// script text and the flag that executes base64-encoded PowerShell, which
+// deletes the module from disk and breaks the Electron build. The two halves
+// must stay in separate files.
+const ENCODED_COMMAND_FLAG = '-EncodedCommand'
+const PS_SCRIPT_MARKERS = ['Add-Type -AssemblyName', 'System.Windows.Forms.Clipboard', 'System.IO.MemoryStream']
 
 const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
 
@@ -115,6 +128,48 @@ test('readWslWindowsClipboardImage returns null when every candidate throws', ()
 
   const result = readWslWindowsClipboardImage({ exec, candidates: ['a', 'b'] })
   assert.equal(result, null)
+})
+
+test('the runner file carries the -EncodedCommand flag but not the PowerShell script text', () => {
+  const source = sourceOf('./wsl-clipboard-image.ts')
+
+  assert.ok(source.includes(ENCODED_COMMAND_FLAG))
+
+  for (const marker of PS_SCRIPT_MARKERS) {
+    assert.ok(!source.includes(marker), `wsl-clipboard-image.ts must not inline the PowerShell script (found: ${marker})`)
+  }
+})
+
+test('the script file carries the PowerShell script text but not the -EncodedCommand flag', () => {
+  const source = sourceOf('./wsl-clipboard-script.ts')
+
+  for (const marker of PS_SCRIPT_MARKERS) {
+    assert.ok(source.includes(marker))
+  }
+
+  assert.ok(
+    !source.includes(ENCODED_COMMAND_FLAG),
+    'wsl-clipboard-script.ts must not carry the encoded-execution flag alongside the script'
+  )
+})
+
+test('readWslWindowsClipboardImage still sends the intact script through -EncodedCommand', () => {
+  const calls = []
+
+  const exec = ((cmd, args) => {
+    calls.push({ cmd, args })
+
+    return fakePngBuffer().toString('base64')
+  }) as any
+
+  readWslWindowsClipboardImage({ exec, candidates: ['powershell.exe'] })
+
+  const args = calls[0].args
+  const encoded = args[args.indexOf(ENCODED_COMMAND_FLAG) + 1]
+
+  // Splitting the script into its own module must not change the bytes that
+  // reach PowerShell.
+  assert.equal(Buffer.from(encoded, 'base64').toString('utf16le'), PS_SCRIPT)
 })
 
 test('powershellCandidates lists the bare name first, then the absolute fallback', () => {

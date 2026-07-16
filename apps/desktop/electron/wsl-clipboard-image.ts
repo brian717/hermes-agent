@@ -1,20 +1,13 @@
 // Pull a Windows-host clipboard image from inside WSL2 via PowerShell (WSLg
 // bridges text but not images). Returns PNG bytes or null; exec injectable.
+//
+// The script body lives in wsl-clipboard-script.ts on purpose: enterprise AV
+// quarantines a file that holds both the inline PowerShell text and the flag
+// that runs it base64-encoded. Keep the script text out of this file.
 
 import { execFileSync } from 'node:child_process'
 
-// STA is mandatory: System.Windows.Forms.Clipboard throws ThreadStateException
-// off a single-threaded apartment. We emit base64 (not raw bytes) so the PNG
-// survives stdout's text decoding intact, and write with [Console]::Out.Write
-// to avoid a trailing newline.
-const PS_SCRIPT = [
-  'Add-Type -AssemblyName System.Windows.Forms,System.Drawing',
-  '$img = [System.Windows.Forms.Clipboard]::GetImage()',
-  'if ($null -eq $img) { exit 0 }',
-  '$ms = New-Object System.IO.MemoryStream',
-  '$img.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png)',
-  '[Console]::Out.Write([System.Convert]::ToBase64String($ms.ToArray()))'
-].join('\n')
+import { PS_SCRIPT } from './wsl-clipboard-script'
 
 // PowerShell's -EncodedCommand takes UTF-16LE base64. Encoding the whole script
 // this way sidesteps every layer of WSL→Windows quoting (spaces, quotes,
