@@ -125,3 +125,82 @@ class TestFailClosedSyntaxGate:
         res = ops.write_file(str(target), content)
         assert res.error is None, res.error
         assert target.read_text() == content
+
+
+class TestYamlLinterMalfunction:
+    """A crash *inside* the YAML linter is a linter malfunction, not a verdict
+    about the candidate content.
+
+    Every genuine syntax error PyYAML can diagnose surfaces as a
+    ``yaml.YAMLError`` subclass (ScannerError / ParserError / ReaderError /
+    ComposerError), so an exception that is *not* a YAMLError carries no
+    information about whether the content parses -- it only means the linter
+    itself broke. Refusing the write on that verdict is a guaranteed false
+    positive, which is exactly what this syntax-only gate is designed to
+    avoid.  Fall back to the existing "no linter available" (``__SKIP__``)
+    path instead, same as a missing PyYAML.
+
+    Regression test for #65924, where a TypeError escaping yaml.parse() made
+    write_file refuse every valid .yml file with
+    "candidate content fails .yml syntax validation (TypeError: ...)".
+    """
+
+    def test_lint_yaml_inproc_skips_on_non_yaml_error(self, monkeypatch):
+        import yaml
+
+        from tools.file_operations import _lint_yaml_inproc
+
+        def _boom(_content):
+            raise TypeError('can only concatenate str (not "int") to str')
+
+        monkeypatch.setattr(yaml, "parse", _boom)
+
+        ok, err = _lint_yaml_inproc("name: Deploy\n")
+        assert ok is True
+        assert err == "__SKIP__", (
+            "a non-YAMLError is a linter malfunction and must be reported as "
+            "'no linter available', not as a syntax-failure verdict"
+        )
+
+    def test_lint_yaml_inproc_still_fails_on_real_syntax_error(self):
+        """The malfunction escape hatch must not swallow real YAMLErrors."""
+        from tools.file_operations import _lint_yaml_inproc
+
+        ok, err = _lint_yaml_inproc('key: "unclosed\n')
+        assert ok is False
+        assert err != "__SKIP__"
+        assert "YAMLError" in err
+
+    def test_yml_write_proceeds_when_linter_raises_non_yaml_error(
+        self, ops, tmp_path: Path, monkeypatch
+    ):
+        """End-to-end #65924: the reporter's GitHub Actions workflow must be
+        written, not refused, when the linter blows up internally."""
+        import yaml
+
+        def _boom(_content):
+            raise TypeError('can only concatenate str (not "int") to str')
+
+        monkeypatch.setattr(yaml, "parse", _boom)
+
+        target = tmp_path / "deploy.yml"
+        content = (
+            "name: Deploy\n"
+            "\n"
+            "on:\n"
+            "  push:\n"
+            "    branches: [main]\n"
+            "  workflow_dispatch:\n"
+            "    inputs:\n"
+            "      environment:\n"
+            '        description: "Deployment target"\n'
+            "        required: true\n"
+            "        default: test\n"
+            "        type: choice\n"
+            "        options:\n"
+            "          - test\n"
+            "          - live\n"
+        )
+        res = ops.write_file(str(target), content)
+        assert res.error is None, res.error
+        assert target.read_text() == content

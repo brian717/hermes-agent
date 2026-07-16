@@ -639,8 +639,16 @@ def _lint_yaml_inproc(content: str) -> tuple[bool, str]:
         return True, ""
     except _yaml.YAMLError as e:
         return False, f"YAMLError: {e}"
-    except Exception as e:  # noqa: BLE001
-        return False, f"{type(e).__name__}: {e}"
+    except Exception:  # noqa: BLE001
+        # Anything that isn't a YAMLError tells us nothing about the
+        # candidate content: every syntax error PyYAML can diagnose is a
+        # YAMLError subclass (Scanner/Parser/Reader/Composer).  So a
+        # non-YAMLError only means the linter itself broke — a mismatched
+        # ``_yaml`` C extension, a shadowed module, a PyYAML bug — and
+        # turning that into a syntax-failure verdict refuses a legitimate
+        # write on evidence that doesn't exist.  Degrade to the same
+        # "no linter available" path as a missing PyYAML.
+        return True, "__SKIP__"
 
 
 def _lint_toml_inproc(content: str) -> tuple[bool, str]:
