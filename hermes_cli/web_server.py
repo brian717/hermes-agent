@@ -5915,6 +5915,34 @@ def _apply_model_assignment_sync(
 
         save_config(cfg)
 
+        # Reconcile the OAuth active-provider pointer. Runtime resolution reads
+        # auth.json's active_provider BEFORE config.yaml's model.provider, so a
+        # stale OAuth pointer (e.g. "nous" from an earlier device-code login)
+        # keeps every new session on the old provider even though the user just
+        # picked a different one here — the desktop bug where saving an
+        # OpenRouter key looked like a no-op (#65706). Mirror the CLI model
+        # setup flows, which call deactivate_provider() whenever the chosen
+        # provider is non-OAuth. Only touch auth.json when there is actually a
+        # stale pointer to clear, to avoid needless active_provider churn.
+        try:
+            from hermes_cli.auth import (
+                deactivate_provider,
+                get_active_provider,
+                provider_owns_active_pointer,
+            )
+
+            current_active = (get_active_provider() or "").strip().lower()
+            if (
+                current_active
+                and current_active != provider.strip().lower()
+                and not provider_owns_active_pointer(provider)
+            ):
+                deactivate_provider()
+        except Exception:
+            # Never block the model assignment on the pointer reconcile —
+            # config.yaml is already persisted and authoritative for the pick.
+            _log.debug("active_provider reconcile skipped", exc_info=True)
+
         # Register a named ``custom_providers`` entry for a custom/local
         # endpoint, mirroring the ``hermes model`` custom flow
         # (_save_custom_provider). Without this the endpoint only lives in

@@ -190,3 +190,31 @@ def test_provider_not_in_registry_but_in_models_dev(tmp_path, monkeypatch):
 
     from hermes_cli.auth import is_provider_explicitly_configured
     assert is_provider_explicitly_configured("openrouter") is True
+
+
+# ---------------------------------------------------------------------------
+# provider_owns_active_pointer()
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("provider_id", ["nous", "openai-codex", "xai-oauth", "qwen-oauth"])
+def test_provider_owns_active_pointer_true_for_oauth(provider_id):
+    """OAuth providers own auth.json's active_provider pointer, so a main-model
+    switch to one must NOT clear it."""
+    from hermes_cli.auth import provider_owns_active_pointer
+    assert provider_owns_active_pointer(provider_id) is True
+
+
+def test_provider_owns_active_pointer_true_for_auto():
+    """The ``auto`` sentinel relies on the active_provider pointer to
+    auto-resolve, so it must be treated as owning it."""
+    from hermes_cli.auth import provider_owns_active_pointer
+    assert provider_owns_active_pointer("auto") is True
+
+
+@pytest.mark.parametrize("provider_id", ["openrouter", "custom", "moa", "openai-api", ""])
+def test_provider_owns_active_pointer_false_for_non_oauth(provider_id):
+    """Non-OAuth / API-key providers resolve from config/env, so switching the
+    main model to one should clear a stale OAuth pointer (#65706)."""
+    from hermes_cli.auth import provider_owns_active_pointer
+    assert provider_owns_active_pointer(provider_id) is False

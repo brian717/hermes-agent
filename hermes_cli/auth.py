@@ -1700,6 +1700,37 @@ def deactivate_provider() -> None:
         _save_auth_store(auth_store)
 
 
+def provider_owns_active_pointer(provider_id: str) -> bool:
+    """Return True when *provider_id* is an OAuth-style provider (or the
+    ``auto`` sentinel) whose active state is owned by ``auth.json``'s
+    ``active_provider`` pointer.
+
+    Runtime resolution reads ``active_provider`` before ``config.yaml``'s
+    ``model.provider`` (see :func:`get_active_provider`). OAuth providers
+    (nous, xai-oauth, qwen-oauth, openai-codex, …) are activated by their own
+    login flow and must keep that pointer, and ``auto`` deliberately relies on
+    it to auto-resolve. Every other provider (openrouter, custom, moa, any
+    ``api_key`` provider) resolves from config/env instead, so a caller that
+    switches the main model to one of them should clear a stale pointer via
+    :func:`deactivate_provider` — otherwise the stale OAuth provider keeps
+    winning and the switch looks like a no-op.
+    """
+    normalized = (provider_id or "").strip().lower()
+    if not normalized:
+        return False
+    if normalized == "auto":
+        return True
+    pconfig = PROVIDER_REGISTRY.get(normalized)
+    if pconfig is None:
+        try:
+            from hermes_cli.providers import get_provider
+            pconfig = get_provider(normalized)
+        except Exception:
+            pconfig = None
+    auth_type = (getattr(pconfig, "auth_type", "") or "").lower()
+    return auth_type.startswith("oauth") or auth_type == "external_process"
+
+
 # =============================================================================
 # Provider Resolution — picks which provider to use
 # =============================================================================

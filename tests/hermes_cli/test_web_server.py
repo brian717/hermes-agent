@@ -2396,6 +2396,76 @@ class TestWebServerEndpoints:
         assert data["provider"] == "openrouter"
         assert data["model"] == "anthropic/claude-sonnet-4.6"
 
+    def test_model_set_main_clears_stale_oauth_active_provider(self, monkeypatch):
+        """Switching the main model to a non-OAuth provider (OpenRouter) must
+        clear auth.json's stale OAuth active_provider pointer. Otherwise runtime
+        resolution keeps reading active_provider ("nous") first and every new
+        session stays on the old provider — the switch looks like a no-op
+        (#65706)."""
+        monkeypatch.setattr(
+            "hermes_cli.model_cost_guard.expensive_model_warning",
+            lambda *_args, **_kwargs: None,
+        )
+        from hermes_cli.auth import (
+            _save_auth_store,
+            get_active_provider,
+        )
+
+        # Simulate a prior Nous Portal OAuth login.
+        _save_auth_store({
+            "active_provider": "nous",
+            "providers": {},
+            "credential_pool": {"nous": {"kind": "oauth"}},
+        })
+        assert get_active_provider() == "nous"
+
+        resp = self.client.post(
+            "/api/model/set",
+            json={
+                "scope": "main",
+                "provider": "openrouter",
+                "model": "anthropic/claude-sonnet-4.6",
+            },
+        )
+        assert resp.status_code == 200
+        assert resp.json()["ok"] is True
+
+        # Stale OAuth pointer cleared, so resolution falls through to config.
+        assert get_active_provider() is None
+        from hermes_cli.config import load_config
+        assert load_config()["model"]["provider"] == "openrouter"
+        # Credentials are preserved — only the active pointer was cleared.
+        from hermes_cli.auth import _load_auth_store
+        assert "nous" in _load_auth_store().get("credential_pool", {})
+
+    def test_model_set_main_preserves_active_provider_for_oauth_switch(self, monkeypatch):
+        """Switching the main model to an OAuth provider must NOT clear the
+        active_provider pointer — that provider's own login owns it, and
+        clearing it would break OAuth auto-resolution."""
+        monkeypatch.setattr(
+            "hermes_cli.model_cost_guard.expensive_model_warning",
+            lambda *_args, **_kwargs: None,
+        )
+        from hermes_cli.auth import _save_auth_store, get_active_provider
+
+        _save_auth_store({
+            "active_provider": "nous",
+            "providers": {},
+            "credential_pool": {"nous": {"kind": "oauth"}},
+        })
+
+        resp = self.client.post(
+            "/api/model/set",
+            json={
+                "scope": "main",
+                "provider": "nous",
+                "model": "openai/gpt-5.5",
+            },
+        )
+        assert resp.status_code == 200
+        assert resp.json()["ok"] is True
+        assert get_active_provider() == "nous"
+
     def test_ops_import_passes_force_flag(self, tmp_path, monkeypatch):
         """force=True must append --force so the spawned non-interactive
         `hermes import` doesn't auto-abort at the overwrite prompt."""
