@@ -12787,6 +12787,18 @@ def _command_has_dedicated_mcp_startup(args) -> bool:
     return False
 
 
+def _command_skips_mcp_discovery(args) -> bool:
+    """Agent-runtime commands that must NOT trigger external MCP discovery.
+
+    ``hermes mcp serve`` re-exposes Hermes's *own* tools over stdio MCP; it
+    never consumes external MCP servers, so discovering them at startup only
+    adds latency (and can hang on a dead server) for no benefit.  It still
+    counts as an agent-runtime command for plugin/hook discovery — only the
+    external MCP tool sweep is skipped.  See #30757.
+    """
+    return args.command == "mcp" and getattr(args, "mcp_action", None) == "serve"
+
+
 def _should_background_mcp_startup(args) -> bool:
     if _is_tui_chat_launch(args):
         return False
@@ -12824,7 +12836,13 @@ def _prepare_agent_startup(args) -> None:
             exc_info=True,
         )
     _run_inline_mcp_discovery = True
-    if _is_tui_chat_launch(args):
+    if _command_skips_mcp_discovery(args):
+        # `mcp serve` re-exposes Hermes's own tools over stdio and never
+        # consumes external MCP servers — skip the discovery sweep entirely
+        # (inline *and* background) so stdio server startup stays fast and
+        # can't hang on a dead external server (#30757).
+        _run_inline_mcp_discovery = False
+    elif _is_tui_chat_launch(args):
         # The TUI launcher hands off to a dedicated startup path that already
         # backgrounds MCP discovery with a bounded join before the first tool
         # snapshot.

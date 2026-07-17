@@ -178,6 +178,103 @@ def test_prepare_agent_startup_skips_mcp_bootstrap_for_tui_chat(monkeypatch):
     assert mcp_startup._mcp_discovery_thread is None
 
 
+def _install_startup_stubs(monkeypatch, calls):
+    """Stub every module `_prepare_agent_startup` imports; count MCP discovery."""
+    monkeypatch.setitem(
+        sys.modules,
+        "hermes_cli.plugins",
+        types.SimpleNamespace(discover_plugins=lambda: None),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "hermes_cli.config",
+        types.SimpleNamespace(
+            read_raw_config=lambda: {"mcp_servers": {"demo": {"transport": "stdio"}}},
+            load_config=lambda: {},
+        ),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "agent.shell_hooks",
+        types.SimpleNamespace(register_from_config=lambda *_a, **_k: None),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "tools.mcp_oauth",
+        types.SimpleNamespace(suppress_interactive_oauth=lambda: nullcontext()),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "tools.mcp_tool",
+        types.SimpleNamespace(
+            discover_mcp_tools=lambda: calls.__setitem__("mcp", calls["mcp"] + 1)
+        ),
+    )
+
+
+def test_command_skips_mcp_discovery_only_for_mcp_serve():
+    assert main_mod._command_skips_mcp_discovery(
+        _agent_args(command="mcp", mcp_action="serve")
+    )
+    # Chat, MCP admin subcommands, and bare invocations are NOT skipped here.
+    assert not main_mod._command_skips_mcp_discovery(_agent_args(command="chat"))
+    assert not main_mod._command_skips_mcp_discovery(
+        _agent_args(command="mcp", mcp_action="list")
+    )
+
+
+def test_prepare_agent_startup_skips_external_discovery_for_mcp_serve(monkeypatch):
+    # `hermes mcp serve` is an agent-runtime command (it runs plugin/hook
+    # discovery) but re-exposes Hermes's own tools over stdio, so it must not
+    # sweep external MCP servers — neither inline nor on a background thread.
+    calls = {"mcp": 0}
+    _install_startup_stubs(monkeypatch, calls)
+
+    main_mod._prepare_agent_startup(_agent_args(command="mcp", mcp_action="serve"))
+
+    assert calls["mcp"] == 0
+    assert mcp_startup._mcp_discovery_thread is None
+
+
+def test_prepare_agent_startup_skips_discovery_for_mcp_admin(monkeypatch):
+    # `mcp list` and friends are not agent-runtime commands at all, so the
+    # startup helper returns before any MCP discovery.
+    calls = {"mcp": 0}
+    _install_startup_stubs(monkeypatch, calls)
+
+    main_mod._prepare_agent_startup(_agent_args(command="mcp", mcp_action="list"))
+
+    assert calls["mcp"] == 0
+    assert mcp_startup._mcp_discovery_thread is None
+
+
+def test_prepare_agent_startup_skips_inline_discovery_for_cron_run(monkeypatch):
+    # `cron run` owns its MCP startup on the real job-runner path, so
+    # `_prepare_agent_startup` must not run inline discovery or background it.
+    calls = {"mcp": 0}
+    _install_startup_stubs(monkeypatch, calls)
+
+    main_mod._prepare_agent_startup(_agent_args(command="cron", cron_command="run"))
+
+    assert calls["mcp"] == 0
+    assert mcp_startup._mcp_discovery_thread is None
+
+
+def test_prepare_agent_startup_still_discovers_for_sibling_agent_command(monkeypatch):
+    # The skip is scoped to `mcp serve`: a sibling agent-runtime command (`rl`)
+    # must still discover external MCP tools (here, on the background thread),
+    # so the new branch can't be a blanket suppression.
+    calls = {"mcp": 0}
+    _install_startup_stubs(monkeypatch, calls)
+
+    main_mod._prepare_agent_startup(_agent_args(command="rl"))
+
+    thread = mcp_startup._mcp_discovery_thread
+    assert thread is not None
+    thread.join(timeout=1.0)
+    assert calls["mcp"] == 1
+
+
 def test_cli_get_tool_definitions_briefly_waits_for_fast_mcp_thread(monkeypatch):
     thread = threading.Thread(target=lambda: time.sleep(0.05), daemon=True)
     thread.start()
