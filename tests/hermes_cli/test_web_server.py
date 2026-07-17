@@ -2396,6 +2396,71 @@ class TestWebServerEndpoints:
         assert data["provider"] == "openrouter"
         assert data["model"] == "anthropic/claude-sonnet-4.6"
 
+    def test_model_set_api_key_provider_clears_stale_oauth_active_provider(
+        self, monkeypatch
+    ):
+        """Saving an API-key provider must clear a stale OAuth active_provider.
+
+        Provider resolution reads ``auth.json``'s ``active_provider`` before
+        ``config.yaml``'s ``model.provider``. A user who logged into Nous
+        Portal and later saves an OpenRouter key stays pinned to nous forever
+        unless the save path deactivates it — the picker then looks like a
+        no-op (#65706). The CLI wizard already does this; the dashboard did not.
+        """
+        monkeypatch.setattr(
+            "hermes_cli.model_cost_guard.expensive_model_warning",
+            lambda *_args, **_kwargs: None,
+        )
+        from hermes_cli.auth import _load_auth_store, _save_auth_store, get_active_provider
+
+        auth_store = _load_auth_store()
+        auth_store["active_provider"] = "nous"
+        _save_auth_store(auth_store)
+        assert get_active_provider() == "nous"
+
+        resp = self.client.post(
+            "/api/model/set",
+            json={
+                "scope": "main",
+                "provider": "openrouter",
+                "model": "anthropic/claude-sonnet-4.6",
+            },
+        )
+
+        assert resp.status_code == 200
+        assert resp.json()["ok"] is True
+
+        from hermes_cli.config import load_config
+
+        assert load_config()["model"]["provider"] == "openrouter"
+        # The stale OAuth pin is gone, so resolution falls through to config.
+        assert get_active_provider() is None
+
+    def test_model_set_oauth_provider_keeps_active_provider(self, monkeypatch):
+        """Selecting an OAuth provider must NOT clear its own active_provider.
+
+        Onboarding logs in (setting active_provider) and *then* posts the model
+        assignment, so an unconditional deactivate would wipe the fresh login.
+        """
+        monkeypatch.setattr(
+            "hermes_cli.model_cost_guard.expensive_model_warning",
+            lambda *_args, **_kwargs: None,
+        )
+        from hermes_cli.auth import _load_auth_store, _save_auth_store, get_active_provider
+
+        auth_store = _load_auth_store()
+        auth_store["active_provider"] = "nous"
+        _save_auth_store(auth_store)
+
+        resp = self.client.post(
+            "/api/model/set",
+            json={"scope": "main", "provider": "nous", "model": "openai/gpt-5.5"},
+        )
+
+        assert resp.status_code == 200
+        assert resp.json()["ok"] is True
+        assert get_active_provider() == "nous"
+
     def test_ops_import_passes_force_flag(self, tmp_path, monkeypatch):
         """force=True must append --force so the spawned non-interactive
         `hermes import` doesn't auto-abort at the overwrite prompt."""

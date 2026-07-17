@@ -5864,6 +5864,35 @@ async def set_model_assignment(body: ModelAssignment, profile: Optional[str] = N
         raise HTTPException(status_code=500, detail="Failed to save model assignment")
 
 
+def _provider_uses_oauth(provider: str) -> bool:
+    """Return True when *provider* authenticates through an OAuth flow.
+
+    Resolved the same way ``auth.is_provider_explicitly_configured`` does: the
+    hand-maintained PROVIDER_REGISTRY first, then the models.dev catalog (where
+    e.g. openrouter lives). Ids with no auth_type (``custom``, ``local``) or a
+    non-OAuth one (``api_key``, ``aws_sdk``, ``virtual``) are not OAuth.
+
+    On lookup failure we report True (i.e. "leave auth.json alone"): wrongly
+    clearing a live OAuth session is far worse than leaving a stale pin in
+    place, which is merely the pre-existing behaviour.
+    """
+    normalized = (provider or "").strip().lower()
+    try:
+        from hermes_cli.auth import PROVIDER_REGISTRY
+
+        pconfig = PROVIDER_REGISTRY.get(normalized)
+        if pconfig is None:
+            from hermes_cli.providers import get_provider
+
+            pconfig = get_provider(normalized)
+        if pconfig is None:
+            return False
+        return str(getattr(pconfig, "auth_type", "") or "").startswith("oauth")
+    except Exception:
+        _log.debug("auth_type lookup failed for %r", normalized, exc_info=True)
+        return True
+
+
 def _apply_model_assignment_sync(
     scope: str, provider: str, model: str, task: str, base_url: str, api_key: str = ""
 ):
@@ -5914,6 +5943,20 @@ def _apply_model_assignment_sync(
                 _log.debug("apply_nous_managed_defaults skipped", exc_info=True)
 
         save_config(cfg)
+
+        # Provider resolution reads auth.json's ``active_provider`` before
+        # config.yaml's ``model.provider``, so saving a non-OAuth provider must
+        # also release a stale OAuth pin — otherwise a user who logged into
+        # Nous Portal and later saved an OpenRouter key stays on nous forever
+        # and the picker reads as a no-op (#65706). Mirrors the CLI wizard,
+        # which calls deactivate_provider() from exactly its non-OAuth flows
+        # (model_setup_flows._model_flow_openrouter and siblings). OAuth
+        # providers are skipped: onboarding logs in first and posts the model
+        # assignment after, so clearing here would wipe the fresh login.
+        if not _provider_uses_oauth(provider):
+            from hermes_cli.auth import deactivate_provider
+
+            deactivate_provider()
 
         # Register a named ``custom_providers`` entry for a custom/local
         # endpoint, mirroring the ``hermes model`` custom flow
