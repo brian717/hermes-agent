@@ -2068,6 +2068,7 @@ export const en: Translations = {
       noModels: 'No models found',
       editModels: 'Edit Models…',
       refreshModels: 'Refresh Models',
+      hideUnconfigured: 'Hide Unconfigured Providers',
       fast: 'Fast',
       medium: 'Med'
     },

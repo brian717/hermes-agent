@@ -28,12 +28,15 @@ import { normalize } from '@/lib/text'
 import { cn } from '@/lib/utils'
 import { $modelPresets, applyModelPreset, modelPresetKey } from '@/store/model-presets'
 import {
+  $hideUnconfiguredProviders,
   $visibleModels,
   collapseModelFamilies,
   DEFAULT_VISIBLE_PER_PROVIDER,
   effectiveVisibleKeys,
+  filterConfiguredProviders,
   type ModelFamily,
   modelVisibilityKey,
+  setHideUnconfiguredProviders,
   setModelVisibilityOpen
 } from '@/store/model-visibility'
 import {
@@ -80,6 +83,7 @@ export function ModelMenuPanel({ gateway, onSelectModel, requestGateway }: Model
   const currentReasoningEffort = useStore($currentReasoningEffort)
   const modelPresets = useStore($modelPresets)
   const visibleModels = useStore($visibleModels)
+  const hideUnconfigured = useStore($hideUnconfiguredProviders)
 
   const modelOptions = useQuery({
     queryKey: ['model-options', activeSessionId || 'global'],
@@ -113,10 +117,13 @@ export function ModelMenuPanel({ gateway, onSelectModel, requestGateway }: Model
     [providers]
   )
 
-  const pickerProviders = useMemo(
-    () => providers?.filter(provider => provider.slug.toLowerCase() !== 'moa') ?? [],
-    [providers]
-  )
+  const pickerProviders = useMemo(() => {
+    const base = providers?.filter(provider => provider.slug.toLowerCase() !== 'moa') ?? []
+
+    // Optionally hide providers the user hasn't set up (no usable credentials),
+    // always keeping the active provider so the current model can't vanish.
+    return filterConfiguredProviders(base, hideUnconfigured, optionsProvider)
+  }, [providers, hideUnconfigured, optionsProvider])
 
   const effectiveVisibleModels = useMemo(
     () => effectiveVisibleKeys(visibleModels, pickerProviders),
@@ -358,6 +365,18 @@ export function ModelMenuPanel({ gateway, onSelectModel, requestGateway }: Model
       >
         <Codicon className={cn(refreshing && 'animate-spin')} name="sync" size="0.75rem" />
         {copy.refreshModels}
+      </DropdownMenuItem>
+
+      <DropdownMenuItem
+        className={cn(dropdownMenuRow, 'text-(--ui-text-tertiary)')}
+        onSelect={event => {
+          event.preventDefault()
+          setHideUnconfiguredProviders(!hideUnconfigured)
+        }}
+      >
+        <Codicon name="filter" size="0.75rem" />
+        <span className="min-w-0 flex-1 truncate">{copy.hideUnconfigured}</span>
+        {hideUnconfigured ? <Codicon className="ml-auto text-foreground" name="check" size="0.75rem" /> : null}
       </DropdownMenuItem>
 
       <DropdownMenuItem

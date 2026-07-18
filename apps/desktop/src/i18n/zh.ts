@@ -2233,6 +2233,7 @@ export const zh: Translations = {
       noModels: '未找到模型',
       editModels: '编辑模型…',
       refreshModels: '刷新模型',
+      hideUnconfigured: '隐藏未配置的提供商',
       fast: '快速',
       medium: '中'
     },

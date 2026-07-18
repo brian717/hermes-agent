@@ -1697,6 +1697,7 @@ export interface Translations {
       noModels: string
       editModels: string
       refreshModels: string
+      hideUnconfigured: string
       fast: string
       medium: string
     }
