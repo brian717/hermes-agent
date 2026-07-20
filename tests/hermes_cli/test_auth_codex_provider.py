@@ -16,6 +16,7 @@ from hermes_cli.auth import (
     _save_codex_tokens,
     _import_codex_cli_tokens,
     _login_openai_codex,
+    get_codex_auth_status,
     refresh_codex_oauth_pure,
     resolve_codex_runtime_credentials,
     resolve_provider,
@@ -121,6 +122,109 @@ def test_resolve_codex_runtime_credentials_force_refresh(tmp_path, monkeypatch):
 
     assert called["count"] == 1
     assert resolved["api_key"] == "access-forced"
+
+
+def test_resolve_codex_runtime_credentials_read_only_skips_refresh(tmp_path, monkeypatch):
+    """read_only must not refresh an expiring token — refresh writes the auth store (#68004)."""
+    hermes_home = tmp_path / "hermes"
+    expiring_token = _jwt_with_exp(int(time.time()) - 10)
+    _setup_hermes_auth(hermes_home, access_token=expiring_token, refresh_token="refresh-old")
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    called = {"count": 0}
+
+    def _fake_refresh(tokens, timeout_seconds):
+        called["count"] += 1
+        return {"access_token": "access-new", "refresh_token": "refresh-new"}
+
+    monkeypatch.setattr("hermes_cli.auth._refresh_codex_auth_tokens", _fake_refresh)
+
+    resolved = resolve_codex_runtime_credentials(read_only=True)
+
+    # No refresh attempted; the stored (expiring) token is reported as-is.
+    assert called["count"] == 0
+    assert resolved["api_key"] == expiring_token
+    assert resolved["source"] == "hermes-auth-store"
+
+
+def test_resolve_codex_runtime_credentials_read_only_skips_cli_recovery(tmp_path, monkeypatch):
+    """read_only must not recover from the Codex CLI — recovery persists the auth store (#68004)."""
+    hermes_home = tmp_path / "hermes"
+    _setup_hermes_auth(hermes_home, access_token="")  # -> codex_auth_missing_access_token
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "missing-codex"))
+
+    calls = {"count": 0}
+
+    def _fake_recover(reason):
+        calls["count"] += 1
+        return None
+
+    monkeypatch.setattr("hermes_cli.auth._recover_codex_tokens_from_cli", _fake_recover)
+
+    # Default (mutating) path attempts CLI recovery.
+    with pytest.raises(AuthError):
+        resolve_codex_runtime_credentials()
+    assert calls["count"] == 1
+
+    # Read-only path must not touch the recovery (write) path.
+    calls["count"] = 0
+    with pytest.raises(AuthError) as exc:
+        resolve_codex_runtime_credentials(read_only=True)
+    assert calls["count"] == 0
+    assert exc.value.code == "codex_auth_missing_access_token"
+
+
+def test_get_codex_auth_status_does_not_persist(tmp_path, monkeypatch):
+    """`hermes status`/`doctor` must not mutate the auth store (#68004).
+
+    Reading the pool normally heals/migrates the store on first load (seeding a
+    ``credential_pool`` entry from the singleton tokens and writing it back). A
+    diagnostic read must leave ``auth.json`` byte-identical.
+    """
+    hermes_home = tmp_path / "hermes"
+    healthy_token = _jwt_with_exp(int(time.time()) + 3600)
+    auth_file = _setup_hermes_auth(
+        hermes_home, access_token=healthy_token, refresh_token="refresh-old"
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    refreshed = {"count": 0}
+
+    def _fake_refresh(tokens, timeout_seconds):
+        refreshed["count"] += 1
+        return {"access_token": "access-new", "refresh_token": "refresh-new"}
+
+    monkeypatch.setattr("hermes_cli.auth._refresh_codex_auth_tokens", _fake_refresh)
+
+    before = auth_file.read_bytes()
+    status = get_codex_auth_status()
+    after = auth_file.read_bytes()
+
+    assert refreshed["count"] == 0
+    assert after == before
+    assert status["logged_in"] is True
+    assert status["api_key"] == healthy_token
+
+
+def test_load_pool_persist_false_does_not_write(tmp_path, monkeypatch):
+    """load_pool(persist=False) reports seeded creds without healing the store (#68004)."""
+    from agent.credential_pool import load_pool
+
+    hermes_home = tmp_path / "hermes"
+    healthy_token = _jwt_with_exp(int(time.time()) + 3600)
+    auth_file = _setup_hermes_auth(
+        hermes_home, access_token=healthy_token, refresh_token="refresh-old"
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    before = auth_file.read_bytes()
+    pool = load_pool("openai-codex", persist=False)
+    after = auth_file.read_bytes()
+
+    # Seeded in memory (so status can report it) but the store is untouched.
+    assert pool.has_credentials() is True
+    assert after == before
 
 
 def test_resolve_codex_runtime_credentials_falls_back_to_pool_when_singleton_empty(tmp_path, monkeypatch):

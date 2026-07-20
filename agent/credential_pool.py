@@ -2535,7 +2535,15 @@ def _seed_custom_pool(pool_key: str, entries: List[PooledCredential]) -> Tuple[b
     return changed, active_sources
 
 
-def load_pool(provider: str) -> CredentialPool:
+def load_pool(provider: str, *, persist: bool = True) -> CredentialPool:
+    """Load the credential pool for ``provider``.
+
+    ``load_pool`` normally heals the on-disk store as a side effect of reading it
+    (seeding pool entries from singleton/env credentials, normalizing rows). Pass
+    ``persist=False`` to suppress that write so a diagnostic, side-effect-free read —
+    e.g. ``hermes status`` / ``hermes doctor`` — never mutates the auth store. The
+    returned pool still reflects the in-memory seeding either way. See issue #68004.
+    """
     provider = (provider or "").strip().lower()
     raw_entries = read_credential_pool(provider)
     disk_ids = {
@@ -2591,7 +2599,7 @@ def load_pool(provider: str) -> CredentialPool:
         )
         changed |= _normalize_pool_priorities(provider, entries)
 
-    if changed:
+    if changed and persist:
         new_ids = {entry.id for entry in entries}
         write_credential_pool(
             provider,

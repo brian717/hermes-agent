@@ -3727,6 +3727,7 @@ def resolve_codex_runtime_credentials(
     force_refresh: bool = False,
     refresh_if_expiring: bool = True,
     refresh_skew_seconds: int = CODEX_ACCESS_TOKEN_REFRESH_SKEW_SECONDS,
+    read_only: bool = False,
 ) -> Dict[str, Any]:
     """Resolve runtime credentials from Hermes's own Codex token store.
 
@@ -3738,17 +3739,32 @@ def resolve_codex_runtime_credentials(
     pool seed, a partial re-auth, or pool-only restoration from a backup — gets a bare
     HTTP 401 ``Missing Authentication header`` from the wire instead of a usable
     credential. See issue #32992.
+
+    When ``read_only`` is set the resolver reports the current stored state without
+    mutating it: CLI-token recovery, the auth-store lock, and the network token refresh
+    are all suppressed. Diagnostic commands (``hermes status`` / ``hermes doctor``) must
+    pass ``read_only=True`` so a status read never imports, refreshes, or persists
+    credentials. See issue #68004.
     """
+    if read_only:
+        # A read-only resolve must not refresh (which acquires the auth-store lock
+        # and writes tokens back). Recovery is gated separately below.
+        force_refresh = False
+        refresh_if_expiring = False
     read_error: Optional[AuthError] = None
     try:
         data = _read_codex_tokens()
     except AuthError as exc:
         read_error = exc
-        if getattr(exc, "relogin_required", False) and getattr(exc, "code", None) in {
-            "codex_auth_missing_access_token",
-            "codex_auth_missing_refresh_token",
-            "codex_auth_invalid_shape",
-        }:
+        if (
+            not read_only
+            and getattr(exc, "relogin_required", False)
+            and getattr(exc, "code", None) in {
+                "codex_auth_missing_access_token",
+                "codex_auth_missing_refresh_token",
+                "codex_auth_invalid_shape",
+            }
+        ):
             imported = _recover_codex_tokens_from_cli(str(getattr(exc, "code", None) or "auth_error"))
             if imported:
                 data = {"tokens": imported, "last_refresh": imported.get("last_refresh")}
@@ -6245,7 +6261,8 @@ def get_codex_auth_status() -> Dict[str, Any]:
     # `hermes model` store device_code tokens.
     try:
         from agent.credential_pool import load_pool
-        pool = load_pool("openai-codex")
+        # persist=False: a status read must not heal/migrate the store (#68004).
+        pool = load_pool("openai-codex", persist=False)
         if pool and pool.has_credentials():
             entry = pool.select()
             if entry is not None:
@@ -6281,9 +6298,11 @@ def get_codex_auth_status() -> Dict[str, Any]:
     except Exception:
         pass
 
-    # Fall back to legacy provider state
+    # Fall back to legacy provider state. This is a diagnostic read, so resolve
+    # read-only: status/doctor must never import, refresh, or persist Codex
+    # credentials as a side effect of reporting their state (see issue #68004).
     try:
-        creds = resolve_codex_runtime_credentials()
+        creds = resolve_codex_runtime_credentials(read_only=True)
         return {
             "logged_in": True,
             "auth_store": str(_auth_file_path()),
