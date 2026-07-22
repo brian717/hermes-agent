@@ -107,6 +107,37 @@ class TestNeedsDeepSeekToolReasoning:
         agent = _make_agent()
         assert agent._needs_deepseek_tool_reasoning() is False
 
+    def test_openrouter_deepseek_slug_not_detected(self) -> None:
+        """Regression #69008: OpenRouter re-exports ``deepseek/deepseek-v4-flash``
+        under a ``deepseek/`` slug but speaks its own protocol and rejects the
+        native ``reasoning_content`` echo. The bare model-name substring must
+        NOT trigger the DeepSeek echo on an aggregator route, otherwise the
+        continuation after tool results permanently 400s the session.
+        """
+        agent = _make_agent(
+            provider="openrouter",
+            model="deepseek/deepseek-v4-flash",
+            base_url="https://openrouter.ai/api/v1",
+        )
+        assert agent._needs_deepseek_tool_reasoning() is False
+
+    def test_custom_provider_openrouter_url_deepseek_slug_not_detected(self) -> None:
+        """Same #69008 route reached via a ``custom`` provider whose base URL
+        points at OpenRouter — the host match must suppress the substring
+        signal even when the provider name isn't a known aggregator."""
+        agent = _make_agent(
+            provider="custom",
+            model="deepseek/deepseek-v4-flash",
+            base_url="https://openrouter.ai/api/v1",
+        )
+        assert agent._needs_deepseek_tool_reasoning() is False
+
+    def test_nous_aggregator_deepseek_slug_not_detected(self) -> None:
+        """Nous is a listed aggregator provider — it re-exports DeepSeek the
+        same way, so the bare model-name signal must not fire."""
+        agent = _make_agent(provider="nous", model="deepseek/deepseek-v4-flash")
+        assert agent._needs_deepseek_tool_reasoning() is False
+
 
 class TestCopyReasoningContentForApi:
     """_copy_reasoning_content_for_api pads reasoning_content for DeepSeek tool-calls."""
@@ -255,6 +286,26 @@ class TestCopyReasoningContentForApi:
         agent = _make_agent(
             provider="openrouter",
             model="anthropic/claude-sonnet-4.6",
+            base_url="https://openrouter.ai/api/v1",
+        )
+        source = {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": "c1", "function": {"name": "terminal"}}],
+        }
+        api_msg: dict = {}
+        agent._copy_reasoning_content_for_api(source, api_msg)
+        assert "reasoning_content" not in api_msg
+
+    def test_openrouter_deepseek_slug_not_padded(self) -> None:
+        """Regression #69008 at the replay layer: a ``deepseek/`` slug served
+        via OpenRouter must NOT get ``reasoning_content`` injected. Padding it
+        is exactly what triggers OpenRouter's ``content[].thinking ... must be
+        passed back`` 400 on the continuation after tool results.
+        """
+        agent = _make_agent(
+            provider="openrouter",
+            model="deepseek/deepseek-v4-flash",
             base_url="https://openrouter.ai/api/v1",
         )
         source = {

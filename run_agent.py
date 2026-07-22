@@ -6233,13 +6233,43 @@ class AIAgent:
         DeepSeek V4 thinking mode requires ``reasoning_content`` on every
         assistant tool-call turn; omitting it causes HTTP 400 when the
         message is replayed in a subsequent API request (#15250).
+
+        Like the Kimi check above, the bare ``deepseek`` model-name signal is
+        suppressed on aggregator routes: OpenRouter and other proxies
+        re-export DeepSeek models under a ``deepseek/`` slug but speak their
+        own protocol and reject the native ``reasoning_content`` echo, so
+        forcing it there permanently 400s the session (#69008). Only the
+        dedicated DeepSeek provider or a direct ``api.deepseek.com`` endpoint
+        enables the echo unconditionally.
         """
         provider = (self.provider or "").lower()
         model = (self.model or "").lower()
-        return (
-            provider == "deepseek"
-            or "deepseek" in model
-            or base_url_host_matches(self.base_url, "api.deepseek.com")
+        if provider == "deepseek" or base_url_host_matches(
+            self.base_url, "api.deepseek.com"
+        ):
+            return True
+        if "deepseek" in model:
+            # A bare model-name match only counts for direct or aliased
+            # DeepSeek deployments, not aggregators that re-export the model
+            # under their own (non-native) protocol.
+            return not self._is_aggregator_route()
+        return False
+
+    def _is_aggregator_route(self) -> bool:
+        """Return True when requests are proxied through a model aggregator.
+
+        Aggregators (OpenRouter, Nous, Kilocode) re-export third-party models
+        under vendor/model slugs but speak their own OpenAI-compatible
+        protocol rather than the upstream vendor's native one, so vendor
+        replay quirks keyed off a bare model name must not fire on these
+        routes. Detection covers both the aggregator provider name and an
+        OpenRouter base URL used with a ``custom`` provider.
+        """
+        from hermes_cli.model_normalize import _AGGREGATOR_PROVIDERS
+
+        provider = (self.provider or "").lower()
+        return provider in _AGGREGATOR_PROVIDERS or base_url_host_matches(
+            self.base_url, "openrouter.ai"
         )
 
     def _needs_mimo_tool_reasoning(self) -> bool:
