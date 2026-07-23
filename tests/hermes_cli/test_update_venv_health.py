@@ -136,9 +136,13 @@ def _proc(pid: int, exe: str, name: str, cmdline: list[str] | None = None, cwd: 
     return proc
 
 
-def test_detect_venv_python_off_windows_is_empty():
-    with patch.object(cli_main, "_is_windows", return_value=False):
-        assert cli_main._detect_venv_python_processes() == []
+def _fake_psutil(procs, parents=()):
+    me = MagicMock()
+    me.parents.return_value = list(parents)
+    return types.SimpleNamespace(
+        process_iter=lambda attrs: iter(list(procs)),
+        Process=lambda *a, **k: me,
+    )
 
 
 @patch.object(cli_main, "_is_windows", return_value=True)
@@ -276,6 +280,157 @@ def test_detect_venv_hermes_cli_cmdline_outside_install_not_matched(_winp, tmp_p
 
 
 # ---------------------------------------------------------------------------
+# _detect_venv_python_processes on POSIX (#70201)
+#
+# POSIX lets the dependency sync rewrite packages under a live interpreter, so
+# the survivor mixes its in-memory version with the new files on disk. The
+# detector must therefore run off Windows too — but psutil resolves `exe`
+# through venv/bin/python's symlink to the base interpreter, so argv[0] is the
+# only reliable venv fingerprint, and the Windows anywhere-in-cmdline fallbacks
+# would flag ordinary shell commands.
+# ---------------------------------------------------------------------------
+
+
+@patch.object(cli_main, "_is_windows", return_value=False)
+def test_detect_venv_python_posix_matches_venv_argv0(_winp, tmp_path):
+    """The venv launcher shows up in argv[0] even when psutil resolves `exe`
+    to the base interpreter behind the symlink."""
+    venv_py = str(tmp_path / "venv" / "bin" / "python")
+    base_py = "/usr/lib/python3.11/bin/python3.11"
+
+    fake_psutil = _fake_psutil(
+        [
+            _proc(101, base_py, "python3.11", [venv_py, "-m", "hermes_cli.main", "serve"]),
+            _proc(102, base_py, "python3.11", [base_py, "somescript.py"], cwd="/home/dev"),
+        ]
+    )
+    with patch.object(cli_main, "PROJECT_ROOT", tmp_path), patch.dict(
+        sys.modules, {"psutil": fake_psutil}
+    ):
+        matches = cli_main._detect_venv_python_processes()
+
+    assert [m[0] for m in matches] == [101]
+    assert matches[0][1] == "python3.11"
+    assert venv_py[:60] in matches[0][2]
+
+
+@patch.object(cli_main, "_is_windows", return_value=False)
+def test_detect_venv_python_posix_matches_exe_under_venv(_winp, tmp_path):
+    """A copied (non-symlinked) venv interpreter still matches on `exe`."""
+    venv_py = str(tmp_path / "venv" / "bin" / "python")
+    fake_psutil = _fake_psutil([_proc(111, venv_py, "python", [venv_py, "-m", "http.server"])])
+    with patch.object(cli_main, "PROJECT_ROOT", tmp_path), patch.dict(
+        sys.modules, {"psutil": fake_psutil}
+    ):
+        assert [m[0] for m in cli_main._detect_venv_python_processes()] == [111]
+
+
+@patch.object(cli_main, "_is_windows", return_value=False)
+def test_detect_venv_python_posix_ignores_shell_naming_the_venv(_winp, tmp_path):
+    """A shell that merely mentions the venv path holds no imports."""
+    venv_py = str(tmp_path / "venv" / "bin" / "python")
+    fake_psutil = _fake_psutil(
+        [
+            _proc(121, "/bin/bash", "bash", ["/bin/bash", "-c", f"tail -f {venv_py}.log"]),
+            _proc(122, "/usr/bin/grep", "grep", ["grep", "-r", "anyio", str(tmp_path / "venv")]),
+        ]
+    )
+    with patch.object(cli_main, "PROJECT_ROOT", tmp_path), patch.dict(
+        sys.modules, {"psutil": fake_psutil}
+    ):
+        assert cli_main._detect_venv_python_processes() == []
+
+
+@patch.object(cli_main, "_is_windows", return_value=False)
+def test_detect_venv_python_posix_ignores_shell_naming_hermes_cli_main(_winp, tmp_path):
+    """The `hermes_cli.main` fallback is restricted to real interpreters, so a
+    shell command containing that text inside the install dir is not a holder."""
+    fake_psutil = _fake_psutil(
+        [
+            _proc(
+                131,
+                "/bin/sh",
+                "sh",
+                ["/bin/sh", "-c", "echo python -m hermes_cli.main serve"],
+                cwd=str(tmp_path),
+            ),
+        ]
+    )
+    with patch.object(cli_main, "PROJECT_ROOT", tmp_path), patch.dict(
+        sys.modules, {"psutil": fake_psutil}
+    ):
+        assert cli_main._detect_venv_python_processes() == []
+
+
+@patch.object(cli_main, "_is_windows", return_value=False)
+def test_detect_venv_python_posix_matches_module_trampoline(_winp, tmp_path):
+    """A real interpreter running this install's module IS a holder."""
+    base_py = "/usr/bin/python3"
+    fake_psutil = _fake_psutil(
+        [
+            _proc(
+                141,
+                base_py,
+                "python3",
+                [base_py, "-m", "hermes_cli.main", "serve"],
+                cwd=str(tmp_path),
+            ),
+        ]
+    )
+    with patch.object(cli_main, "PROJECT_ROOT", tmp_path), patch.dict(
+        sys.modules, {"psutil": fake_psutil}
+    ):
+        assert [m[0] for m in cli_main._detect_venv_python_processes()] == [141]
+
+
+@patch.object(cli_main, "_is_windows", return_value=False)
+def test_detect_venv_python_posix_excludes_only_self(_winp, tmp_path):
+    """No setuptools launcher off Windows: `hermes` IS this process, so an
+    ancestor running from the venv is a genuine holder and must be reported."""
+    import os as _os
+
+    venv_py = str(tmp_path / "venv" / "bin" / "python")
+    parent = MagicMock()
+    parent.pid = 555
+    fake_psutil = _fake_psutil(
+        [
+            _proc(_os.getpid(), venv_py, "python", [venv_py, "-m", "hermes_cli.main", "update"]),
+            _proc(555, venv_py, "python", [venv_py, "-m", "hermes_cli.main", "serve"]),
+        ],
+        parents=[parent],
+    )
+    with patch.object(cli_main, "PROJECT_ROOT", tmp_path), patch.dict(
+        sys.modules, {"psutil": fake_psutil}
+    ):
+        assert [m[0] for m in cli_main._detect_venv_python_processes()] == [555]
+
+
+@patch.object(cli_main, "_is_windows", return_value=False)
+def test_detect_venv_python_honors_exclude_pids(_winp, tmp_path):
+    venv_py = str(tmp_path / "venv" / "bin" / "python")
+    fake_psutil = _fake_psutil(
+        [
+            _proc(161, venv_py, "python", [venv_py, "-m", "hermes_cli.main", "gateway", "run"]),
+            _proc(162, venv_py, "python", [venv_py, "-m", "hermes_cli.main", "serve"]),
+        ]
+    )
+    with patch.object(cli_main, "PROJECT_ROOT", tmp_path), patch.dict(
+        sys.modules, {"psutil": fake_psutil}
+    ):
+        matches = cli_main._detect_venv_python_processes(exclude_pids={161})
+
+    assert [m[0] for m in matches] == [162]
+
+
+def test_format_venv_holders_message_explains_posix_mixed_runtime():
+    matches = [(101, "python3", "/opt/hermes/venv/bin/python -m hermes_cli.main serve")]
+    msg = cli_main._format_venv_python_holders_message(matches, windows=False)
+    assert ".pyd" not in msg
+    assert "mixed runtime" in msg
+    assert "--force-venv" in msg
+
+
+# ---------------------------------------------------------------------------
 # --force vs --force-venv gating of the venv-holder guard
 # ---------------------------------------------------------------------------
 
@@ -295,7 +450,7 @@ def _update_args(**overrides):
     return SimpleNamespace(**defaults)
 
 
-def _run_update_until_guard(args):
+def _run_update_until_guard(args, *, windows=True, holders=None, gateway_pids=frozenset()):
     """Drive _cmd_update_impl just far enough to hit the venv-holder guard.
 
     Everything before the guard is stubbed; the guard firing is observed via
@@ -310,16 +465,23 @@ def _run_update_until_guard(args):
         def __truediv__(self, _other):
             raise _PastGuard
 
-    with patch.object(cli_main, "_is_windows", return_value=True), patch.object(
+    if holders is None:
+        holders = [(101, "python.exe", "python.exe -m hermes_cli.main serve")]
+
+    def _detect(*, exclude_pids=None):
+        skip = set(exclude_pids or set())
+        return [h for h in holders if h[0] not in skip]
+
+    with patch.object(cli_main, "_is_windows", return_value=windows), patch.object(
         cli_main, "_venv_scripts_dir", return_value=None
     ), patch.object(cli_main, "_run_pre_update_backup"), patch.object(
         cli_main, "_pause_windows_gateways_for_update", return_value=None
     ), patch.object(
         cli_main, "_resume_windows_gateways_after_update"
     ), patch.object(
-        cli_main,
-        "_detect_venv_python_processes",
-        return_value=[(101, "python.exe", "python.exe -m hermes_cli.main serve")],
+        cli_main, "_detect_venv_python_processes", side_effect=_detect
+    ), patch.object(
+        cli_main, "_venv_guard_excluded_gateway_pids", return_value=set(gateway_pids)
     ), patch.object(
         cli_main, "PROJECT_ROOT", _RootSentinel()
     ):
@@ -344,3 +506,42 @@ def _run_update_until_guard(args):
 def test_venv_holder_guard_force_semantics(force, force_venv, expected, capsys):
     result = _run_update_until_guard(_update_args(force=force, force_venv=force_venv))
     assert result == expected, capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    "force,force_venv,expected",
+    [
+        (False, False, "exit_2"),
+        (True, False, "exit_2"),
+        (False, True, "past_guard"),
+    ],
+)
+def test_venv_holder_guard_runs_on_posix(force, force_venv, expected, capsys):
+    """#70201: the guard must stop the dependency sync off Windows too."""
+    result = _run_update_until_guard(
+        _update_args(force=force, force_venv=force_venv), windows=False
+    )
+    assert result == expected, capsys.readouterr().out
+
+
+def test_venv_holder_guard_posix_exempts_managed_gateways(capsys):
+    """A running gateway must not block the update off Windows: the updater
+    restarts every gateway itself, and the gateway's own /update spawns this
+    process while still alive."""
+    gateway = (321, "python", "/opt/hermes/venv/bin/python -m hermes_cli.main gateway run")
+    result = _run_update_until_guard(
+        _update_args(), windows=False, holders=[gateway], gateway_pids={321}
+    )
+    assert result == "past_guard", capsys.readouterr().out
+
+
+def test_venv_holder_guard_posix_still_faults_on_unmanaged_holder(capsys):
+    """Exempting gateways must not exempt the desktop backend beside them."""
+    holders = [
+        (321, "python", "/opt/hermes/venv/bin/python -m hermes_cli.main gateway run"),
+        (322, "python", "/opt/hermes/venv/bin/python -m hermes_cli.main serve"),
+    ]
+    result = _run_update_until_guard(
+        _update_args(), windows=False, holders=holders, gateway_pids={321}
+    )
+    assert result == "exit_2", capsys.readouterr().out

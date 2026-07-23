@@ -10206,6 +10206,25 @@ def _venv_core_imports_healthy() -> tuple[bool, str]:
     return True, ""
 
 
+def _looks_like_python_process(name: str, argv0: str) -> bool:
+    """True when a process is a Python/PyPy interpreter rather than a shell.
+
+    Used to keep the ``hermes_cli.main`` cmdline fallback from matching a
+    shell command that merely *mentions* the module (``grep -r hermes_cli.main
+    .``, a systemd ``ExecStart=`` line echoed by ``ps``). Those hold no
+    imports and block nothing.
+    """
+    for candidate in (name, argv0):
+        if not candidate:
+            continue
+        stem = Path(candidate).name.lower()
+        if stem.endswith(".exe"):
+            stem = stem[:-4]
+        if stem.startswith(("python", "pypy")):
+            return True
+    return False
+
+
 def _detect_venv_python_processes(
     *, exclude_pids: set[int] | None = None
 ) -> list[tuple[int, str, str]]:
@@ -10218,37 +10237,69 @@ def _detect_venv_python_processes(
     dependency sync mid-update dies with access-denied and strands the venv
     half-updated (ryanc's brotlicffi/_sodium.pyd incidents, July 2026).
 
-    Killing them from here is pointless — the Desktop app supervises its
+    POSIX has no file locks, which is worse rather than better: the sync
+    happily rewrites packages underneath a running interpreter, and the
+    survivor then mixes the abstractions it already imported with
+    implementation files loaded lazily from the *new* version (#70201 —
+    ``Can't instantiate abstract class TaskGroup`` after AnyIO went
+    4.14 → 4.12 under a live web process). So the detector runs everywhere.
+
+    Killing holders from here is pointless — the Desktop app supervises its
     backend and respawns it within seconds — so the caller should refuse and
     tell the user to close the app instead. Returns ``(pid, name, cmdline)``
-    tuples; empty off-Windows / without psutil / when nothing matches. The
-    calling process and its ancestors are always excluded (a CLI ``hermes
-    update`` itself runs from the venv python). Never raises.
+    tuples; empty without psutil / when nothing matches. The calling process
+    is always excluded (a CLI ``hermes update`` itself runs from the venv
+    python), plus its ancestors on Windows, where the setuptools
+    ``hermes.exe`` launcher is the parent of this python. On POSIX ``hermes``
+    IS this process (shebang script) and an ancestor can be a genuine holder,
+    so only self is skipped. Never raises.
     """
-    if not _is_windows():
-        return []
     try:
         import psutil
     except Exception:
         return []
 
-    venv_dir = PROJECT_ROOT / "venv"
-    try:
-        venv_prefix = str(venv_dir.resolve()).lower().rstrip(os.sep) + os.sep
-    except OSError:
-        venv_prefix = str(venv_dir).lower().rstrip(os.sep) + os.sep
-    try:
-        root_prefix = str(PROJECT_ROOT.resolve()).lower().rstrip(os.sep) + os.sep
-    except OSError:
-        root_prefix = str(PROJECT_ROOT).lower().rstrip(os.sep) + os.sep
+    windows = _is_windows()
+
+    def _norm(value: str) -> str:
+        # Windows paths compare case-insensitively. POSIX paths do not, and
+        # folding them would conflate distinct installs (/srv/Hermes vs
+        # /srv/hermes).
+        return value.lower() if windows else value
+
+    def _prefixes(path: Path) -> list[str]:
+        # Both the literal and the resolved form: the venv interpreter is a
+        # symlink on POSIX and the install root itself may live behind one
+        # (/home → /System/Volumes/Data/home on macOS), so a process can
+        # legitimately name either spelling.
+        try:
+            candidates = (str(path), str(path.resolve()))
+        except OSError:
+            candidates = (str(path),)
+        out: list[str] = []
+        for candidate in candidates:
+            prefix = _norm(candidate).rstrip(os.sep) + os.sep
+            if prefix not in out:
+                out.append(prefix)
+        return out
+
+    venv_prefixes = _prefixes(PROJECT_ROOT / "venv")
+    root_prefixes = _prefixes(PROJECT_ROOT)
+
+    def _under(value: str, prefixes: list[str]) -> bool:
+        return bool(value) and any(value.startswith(p) for p in prefixes)
+
+    def _mentions(text: str, prefixes: list[str]) -> bool:
+        return any(p in text for p in prefixes)
 
     skip: set[int] = set(exclude_pids or set())
     skip.add(os.getpid())
-    try:
-        for anc in psutil.Process().parents():
-            skip.add(int(anc.pid))
-    except Exception:
-        pass
+    if windows:
+        try:
+            for anc in psutil.Process().parents():
+                skip.add(int(anc.pid))
+        except Exception:
+            pass
 
     matches: list[tuple[int, str, str]] = []
     try:
@@ -10262,38 +10313,85 @@ def _detect_venv_python_processes(
             continue
         pid = info.get("pid")
         exe = info.get("exe")
-        if not exe or pid is None or int(pid) in skip:
+        if pid is None or int(pid) in skip:
             continue
-        try:
-            exe_norm = str(Path(exe).resolve()).lower()
-        except (OSError, ValueError):
-            exe_norm = str(exe).lower()
-        cmdline_raw = " ".join(info.get("cmdline") or [])
-        cmdline_low = cmdline_raw.lower()
-        cwd_low = str(info.get("cwd") or "").lower().rstrip(os.sep) + os.sep
+        cmdline_list = [str(part) for part in (info.get("cmdline") or [])]
+        argv0 = cmdline_list[0] if cmdline_list else ""
+        if not exe and (windows or not argv0):
+            continue
+        if exe:
+            try:
+                exe_norm = _norm(str(Path(exe).resolve()))
+            except (OSError, ValueError):
+                exe_norm = _norm(str(exe))
+        else:
+            exe_norm = ""
+        # argv[0] is deliberately NOT resolved: `venv/bin/python` is a symlink
+        # to the base interpreter, and resolving it would erase the only
+        # evidence that this process runs out of the venv.
+        argv0_norm = _norm(argv0)
+        cmdline_raw = " ".join(cmdline_list)
+        cmdline_low = _norm(cmdline_raw)
+        cwd_low = _norm(str(info.get("cwd") or "")).rstrip(os.sep) + os.sep
 
-        # Primary match: the executable itself lives under this venv
-        # (venv\Scripts\python(w).exe — the desktop backend / gateway case).
-        is_holder = exe_norm.startswith(venv_prefix)
-        # Fallback: uv/base-interpreter trampolines run a python whose exe is
-        # OUTSIDE the venv but which still imports from it and holds its .pyd
-        # files. Catch those by what they're running: a cmdline that references
-        # this venv's path, or a `-m hermes_cli.main ...` invocation tied to
-        # this install (install root in the cmdline or as the working dir).
-        if not is_holder and venv_prefix in cmdline_low:
+        # Primary match: the interpreter this process runs lives under the
+        # venv (venv\Scripts\python(w).exe / venv/bin/python — the desktop
+        # backend, a dashboard, a stray shell's `hermes ...`).
+        is_holder = _under(exe_norm, venv_prefixes)
+        # On POSIX psutil resolves `exe` through the venv symlink to the base
+        # interpreter, so argv[0] is the only reliable venv fingerprint there.
+        if not is_holder:
+            is_holder = _under(argv0_norm, venv_prefixes)
+        # Windows-only fallback: uv/base-interpreter trampolines pass the venv
+        # interpreter or a venv script as an *argument*. Applying the same
+        # anywhere-in-cmdline match on POSIX would flag any shell that merely
+        # names the venv path (`tail -f venv/…`, `grep -r … venv`).
+        if not is_holder and windows and _mentions(cmdline_low, venv_prefixes):
             is_holder = True
-        if not is_holder and "hermes_cli.main" in cmdline_low:
-            if root_prefix in cmdline_low or cwd_low.startswith(root_prefix):
-                is_holder = True
+        name = str(info.get("name") or "") or Path(exe or argv0).name
+        # Trampolines that name neither path but run this install's module
+        # (install root in the cmdline or as the working dir) still import
+        # from the venv and hold its files.
+        if (
+            not is_holder
+            and "hermes_cli.main" in cmdline_low
+            and _looks_like_python_process(name, argv0)
+            and (_mentions(cmdline_low, root_prefixes) or _under(cwd_low, root_prefixes))
+        ):
+            is_holder = True
         if not is_holder:
             continue
-        name = info.get("name") or Path(exe).name
         matches.append((int(pid), str(name), cmdline_raw[:120]))
     return matches
 
 
-def _format_venv_python_holders_message(matches: list[tuple[int, str, str]]) -> str:
+def _venv_guard_excluded_gateway_pids() -> set[int]:
+    """PIDs the updater manages itself, so the holder guard must not fault on them.
+
+    Gateways run from the venv, and every successful update restarts all of
+    them (Windows also stops them up-front in
+    ``_pause_windows_gateways_for_update``). Faulting on a gateway would
+    refuse every update on a machine that runs one — including the gateway's
+    own ``/update``, which spawns ``hermes update --gateway`` detached from
+    the still-live gateway. Consumers the updater does NOT manage (desktop
+    backend, ``hermes serve``, user terminals, cron helpers) still trip the
+    guard. Never raises.
+    """
+    try:
+        from hermes_cli.gateway import find_gateway_pids
+
+        return {int(pid) for pid in find_gateway_pids(all_profiles=True)}
+    except Exception as exc:
+        logger.debug("Could not enumerate gateway PIDs for the venv guard: %s", exc)
+        return set()
+
+
+def _format_venv_python_holders_message(
+    matches: list[tuple[int, str, str]], *, windows: bool | None = None
+) -> str:
     """Explain which venv processes block the update and how to clear them."""
+    if windows is None:
+        windows = _is_windows()
     lines = [
         "✗ Other Hermes processes are running from this install's venv:",
     ]
@@ -10308,12 +10406,26 @@ def _format_venv_python_holders_message(matches: list[tuple[int, str, str]]) -> 
     if len(matches) > 6:
         lines.append(f"  ... and {len(matches) - 6} more")
     lines.append("")
-    lines.append(
-        "  On Windows these keep native extension files (.pyd) locked, so the"
-    )
-    lines.append(
-        "  dependency update would fail partway and leave a broken install."
-    )
+    if windows:
+        lines.append(
+            "  On Windows these keep native extension files (.pyd) locked, so the"
+        )
+        lines.append(
+            "  dependency update would fail partway and leave a broken install."
+        )
+    else:
+        lines.append(
+            "  These have the current dependencies mapped in memory. Replacing the"
+        )
+        lines.append(
+            "  files underneath them leaves a mixed runtime — a survivor keeps the"
+        )
+        lines.append(
+            "  interfaces it already imported and lazily loads the new implementation"
+        )
+        lines.append(
+            "  on top of them, which fails in ways a restart is the only cure for."
+        )
     lines.append(
         "  Close the Hermes desktop app / other Hermes terminals, then re-run:"
     )
@@ -10792,8 +10904,19 @@ def _cmd_update_impl(args, gateway_mode: bool):
     # and app.asar — a non-desktop venv python holding a .pyd would sail
     # through and corrupt the sync (the exact failure this guard exists for).
     # --force-venv is the explicit escape hatch.
-    if _is_windows() and not getattr(args, "force_venv", False):
+    #
+    # POSIX needs the same boundary for a different reason (#70201): package
+    # files are replaceable while in use there, so instead of failing loudly
+    # the sync leaves a survivor mixing its in-memory version with the new
+    # one on disk. Gateways are exempt off Windows — the updater restarts
+    # them itself, and Windows already stopped them just above.
+    if not getattr(args, "force_venv", False):
         _venv_holders = _detect_venv_python_processes()
+        if _venv_holders and not _is_windows():
+            # Resolved only when something was actually found, so the common
+            # no-holder update never pays for the gateway process scan.
+            _managed_pids = _venv_guard_excluded_gateway_pids()
+            _venv_holders = [h for h in _venv_holders if h[0] not in _managed_pids]
         if _venv_holders:
             print(_format_venv_python_holders_message(_venv_holders))
             _resume_windows_gateways_after_update(_windows_gateway_resume)

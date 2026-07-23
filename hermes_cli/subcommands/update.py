@@ -71,6 +71,6 @@ def build_update_parser(subparsers, *, cmd_update: Callable) -> None:
         "--force-venv",
         action="store_true",
         default=False,
-        help="Windows: mutate the venv even while other processes are running from its interpreter (desktop backend, gateway, terminals). Those processes keep native .pyd files locked, so the dependency sync will likely fail partway and strand the install half-updated. Use only if you know the detected holders are false positives.",
+        help="Mutate the venv even while other processes are running from its interpreter (desktop backend, terminals). On Windows those processes keep native .pyd files locked, so the dependency sync will likely fail partway and strand the install half-updated; on macOS/Linux the sync instead succeeds and leaves the survivors mixing their in-memory dependencies with the rewritten files on disk. Use only if you know the detected holders are false positives.",
     )
     update_parser.set_defaults(func=cmd_update)
