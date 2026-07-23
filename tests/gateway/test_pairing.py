@@ -69,6 +69,68 @@ class TestSplitPairingDirMigration:
         assert migrated["ou_other"]["user_name"] == "Other"
 
 
+class TestPerProfilePairingDirMigration:
+    """Regression for #69398.
+
+    v2026.7.20 moved the per-profile PairingStore path from
+    ``profiles/<name>/platforms/pairing/`` to ``profiles/<name>/pairing/``.
+    On an upgraded multiplex deployment the 0.18.x approvals sitting under
+    the old ``platforms/pairing/`` location were silently orphaned, so an
+    already-paired operator got "Unauthorized user" and a fresh pairing code.
+    """
+
+    def test_legacy_platforms_pairing_approvals_are_honored(self, tmp_path, monkeypatch):
+        home = tmp_path / "home"
+        legacy = home / "profiles" / "home-ops" / "platforms" / "pairing"
+        legacy.mkdir(parents=True)
+        (legacy / "telegram-approved.json").write_text(json.dumps({
+            "123456": {"user_name": "Operator", "approved_at": 123.0}
+        }))
+
+        monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: home)
+        store = PairingStore(profile="home-ops")
+        assert store.is_approved("telegram", "123456") is True
+
+        # The legacy approval is healed into the new per-profile location.
+        new = home / "profiles" / "home-ops" / "pairing"
+        migrated = json.loads((new / "telegram-approved.json").read_text())
+        assert "123456" in migrated
+
+    def test_new_profile_entries_win_over_legacy(self, tmp_path, monkeypatch):
+        home = tmp_path / "home"
+        legacy = home / "profiles" / "home-ops" / "platforms" / "pairing"
+        new = home / "profiles" / "home-ops" / "pairing"
+        legacy.mkdir(parents=True)
+        new.mkdir(parents=True)
+        (new / "telegram-approved.json").write_text(json.dumps({
+            "123456": {"user_name": "Current", "approved_at": 2.0}
+        }))
+        (legacy / "telegram-approved.json").write_text(json.dumps({
+            "123456": {"user_name": "Stale", "approved_at": 1.0},
+            "789012": {"user_name": "Other", "approved_at": 1.0},
+        }))
+
+        monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: home)
+        store = PairingStore(profile="home-ops")
+        assert store.is_approved("telegram", "123456") is True
+        assert store.is_approved("telegram", "789012") is True
+
+        migrated = json.loads((new / "telegram-approved.json").read_text())
+        assert migrated["123456"]["user_name"] == "Current"
+        assert migrated["789012"]["user_name"] == "Other"
+
+    def test_no_legacy_dir_is_a_noop(self, tmp_path, monkeypatch):
+        """Fresh installs (no legacy path) must not gain spurious state."""
+        home = tmp_path / "home"
+        (home / "profiles" / "home-ops").mkdir(parents=True)
+
+        monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: home)
+        store = PairingStore(profile="home-ops")
+        assert store.is_approved("telegram", "123456") is False
+
+        assert not (home / "profiles" / "home-ops" / "platforms" / "pairing").exists()
+
+
 # ---------------------------------------------------------------------------
 # _secure_write
 # ---------------------------------------------------------------------------

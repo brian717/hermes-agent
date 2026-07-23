@@ -253,7 +253,8 @@ class PairingStore:
         # and PairingStore may be constructed before the env is set.
         if profile:
             from hermes_constants import get_hermes_home
-            self._dir = get_hermes_home() / "profiles" / profile / "pairing"
+            profile_root = get_hermes_home() / "profiles" / profile
+            self._dir = profile_root / "pairing"
         else:
             self._dir = PAIRING_DIR
         self._dir.mkdir(parents=True, exist_ok=True)
@@ -262,6 +263,15 @@ class PairingStore:
             # the legacy and new directories (per-profile stores never had
             # the legacy/new split).
             _migrate_split_pairing_dirs()
+        else:
+            # Heal 0.18.x per-profile approvals that lived under the old
+            # ``profiles/<name>/platforms/pairing/`` path before v2026.7.20
+            # moved the per-profile store to ``profiles/<name>/pairing/``
+            # (#69398). Without this, an upgraded multiplex deployment
+            # silently orphans already-approved users and re-issues pairing
+            # codes ("Unauthorized user"). New installs never wrote the legacy
+            # directory, so this is a no-op there.
+            _merge_pairing_dir(self._dir, profile_root / "platforms" / "pairing")
         # Protects all read-modify-write cycles. The gateway runs multiple
         # platform adapters concurrently in threads sharing one PairingStore.
         self._lock = threading.RLock()
