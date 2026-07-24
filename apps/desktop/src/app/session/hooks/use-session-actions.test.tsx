@@ -1382,6 +1382,94 @@ describe('resumeSession warm-cache mapping integrity', () => {
     expect(renderedMessages).not.toContain('stale runtime answer')
   })
 
+  it('preserves a prompt submitted while warm session activation is still pending', async () => {
+    // #70785: a warm-cache resume snapshots the transcript, then awaits
+    // session.activate. If the user submits while that RPC is in flight, the
+    // optimistic user row lands in the LIVE runtime cache — not in the snapshot
+    // activatedMessages was reconciled against. The activation projection must
+    // not paint over it, or the accepted prompt vanishes while its turn runs.
+    const runtimeIdByStoredSessionIdRef: MutableRefObject<Map<string, string>> = {
+      current: new Map([['stored-A', 'rt-A']])
+    }
+
+    const warmState = clientState('stored-A')
+    warmState.messages = [
+      {
+        id: 'stored-user',
+        role: 'user',
+        parts: [{ type: 'text', text: 'earlier question' }]
+      },
+      {
+        id: 'stored-assistant',
+        role: 'assistant',
+        parts: [{ type: 'text', text: 'earlier answer' }]
+      }
+    ]
+
+    const sessionStateByRuntimeIdRef: MutableRefObject<Map<string, ClientSessionState>> = {
+      current: new Map([['rt-A', warmState]])
+    }
+
+    const requestGateway = vi.fn(async (method: string) => {
+      if (method === 'session.activate') {
+        // Prompt submission lands in the live runtime cache while activate is
+        // still pending — a NEW state object, exactly as updateSessionState
+        // writes it, so the captured warm snapshot stays two messages long.
+        const live = sessionStateByRuntimeIdRef.current.get('rt-A')!
+
+        sessionStateByRuntimeIdRef.current.set('rt-A', {
+          ...live,
+          messages: [
+            ...live.messages,
+            {
+              id: 'user-optimistic',
+              role: 'user',
+              parts: [{ type: 'text', text: 'prompt submitted during activation' }]
+            }
+          ]
+        })
+
+        // The older warm-cache projection resolves; it does NOT carry the new
+        // prompt, and reports the turn as running.
+        return {
+          session_id: 'rt-A',
+          session_key: 'stored-A',
+          resumed: 'stored-A',
+          message_count: 2,
+          messages: [
+            { content: 'earlier question', role: 'user', timestamp: 1 },
+            { content: 'earlier answer', role: 'assistant', timestamp: 2 }
+          ],
+          running: true,
+          info: {}
+        } as never
+      }
+
+      return {} as never
+    })
+
+    vi.mocked(getSessionMessages).mockResolvedValue({ messages: [], session_id: 'stored-A' } as never)
+
+    let resumedState: ClientSessionState | undefined
+    let resume: ((storedSessionId: string, replaceRoute?: boolean) => Promise<unknown>) | null = null
+
+    render(
+      <ResumeHarness
+        onReady={r => (resume = r)}
+        onStateUpdate={(_sessionId, next) => (resumedState = next)}
+        requestGateway={requestGateway}
+        runtimeIdByStoredSessionIdRef={runtimeIdByStoredSessionIdRef}
+        sessionStateByRuntimeIdRef={sessionStateByRuntimeIdRef}
+      />
+    )
+    await waitFor(() => expect(resume).not.toBeNull())
+    await resume!('stored-A', true)
+
+    // The accepted prompt survives the activation paint.
+    const renderedMessages = JSON.stringify(resumedState?.messages)
+    expect(renderedMessages).toContain('prompt submitted during activation')
+  })
+
   it('keeps a warm runtime and optimistic turn on a transient activation timeout', async () => {
     const runtimeIdByStoredSessionIdRef: MutableRefObject<Map<string, string>> = {
       current: new Map([['stored-A', 'rt-A']])

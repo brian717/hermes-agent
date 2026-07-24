@@ -746,6 +746,19 @@ export function useSessionActions({
                 }
               }
 
+              // A prompt submitted into this runtime while session.activate was
+              // in flight lands in the live runtime cache, not in the pre-await
+              // warm snapshot (cachedViewState.messages) that activatedMessages
+              // was reconciled against. Reconcile once more against the current
+              // cache entry so that optimistic turn survives — otherwise the
+              // activation projection paints over an accepted prompt and the
+              // user's bubble disappears while its backend turn runs (#70785).
+              const liveRuntimeMessages = sessionStateByRuntimeIdRef.current.get(cachedRuntimeId)?.messages
+
+              if (liveRuntimeMessages && liveRuntimeMessages !== cachedViewState.messages) {
+                activatedMessages = preserveLocalPendingTurnMessages(activatedMessages, liveRuntimeMessages)
+              }
+
               const activatedState = updateSessionState(
                 cachedRuntimeId,
                 state => ({
