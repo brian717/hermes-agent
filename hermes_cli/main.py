@@ -15639,6 +15639,42 @@ def cmd_claw(args):
     claw_command(args)
 
 
+def _register_secrets_subcommands(secrets_bw, secrets_op):
+    """Attach the Bitwarden / 1Password subcommand trees to ``hermes secrets``.
+
+    Returns the ``ImportError`` that prevented registration, or ``None`` on
+    success.
+
+    The two handler modules are the only ones reached from parser construction
+    that pull a compiled third-party extension: ``secrets_cli`` imports
+    ``agent.secret_sources.bitwarden``, which imports ``cryptography`` at module
+    scope. Parser construction runs on EVERY ``hermes`` invocation, so letting
+    that ImportError escape takes down the whole CLI — including ``hermes
+    update``, the one command that repairs the install. On Windows that is a
+    dead end: ``uv pip install -e .`` cannot replace ``cryptography``'s
+    ``_rust.pyd`` while a hermes process holds it open, so the venv is left with
+    a half-removed ``cryptography`` and every subsequent ``hermes update`` exits
+    before it starts (issue #73381).
+
+    Degrade instead: the rest of the CLI stays usable and ``hermes secrets``
+    reports what is missing (see ``_dispatch_secrets`` in ``main``).
+    """
+    try:
+        from hermes_cli import secrets_cli as _secrets_cli
+        from hermes_cli import onepassword_secrets_cli as _op_secrets_cli
+    except ImportError as exc:
+        # Swallow whatever the user typed so ``hermes secrets bitwarden status``
+        # reaches the dispatcher — which names the broken dependency — instead
+        # of dying in argparse with "unrecognized arguments: status".
+        for stub in (secrets_bw, secrets_op):
+            stub.add_argument("args", nargs="*", help=argparse.SUPPRESS)
+        return exc
+
+    _secrets_cli.register_cli(secrets_bw)
+    _op_secrets_cli.register_cli(secrets_op)
+    return None
+
+
 def main():
     """Main entry point for hermes CLI."""
     # Cosmetic: make the process show up as 'hermes' instead of 'python3.11'
@@ -15775,17 +15811,24 @@ def main():
         help="1Password (op:// references) integration",
     )
 
-    # Lazy import — only pays for itself when this subcommand is actually used.
-    from hermes_cli import secrets_cli as _secrets_cli
-    from hermes_cli import onepassword_secrets_cli as _op_secrets_cli
-
-    _secrets_cli.register_cli(secrets_bw)
-    _op_secrets_cli.register_cli(secrets_op)
+    # Never fatal: a missing/half-installed dependency here must not take the
+    # whole CLI down with it (issue #73381).
+    _secrets_import_error = _register_secrets_subcommands(secrets_bw, secrets_op)
 
     def _dispatch_secrets(args):  # noqa: ANN001
         sub = getattr(args, "secrets_command", None)
         bw_sub = getattr(args, "secrets_bw_command", None)
         op_sub = getattr(args, "secrets_op_command", None)
+        if _secrets_import_error is not None:
+            print(
+                f"hermes secrets is unavailable: {_secrets_import_error}",
+                file=sys.stderr,
+            )
+            print(
+                "  The install looks incomplete. Repair it with: hermes update",
+                file=sys.stderr,
+            )
+            return 1
         if sub in ("bitwarden", "bw") and bw_sub is not None:
             return args.func(args)
         if sub in ("onepassword", "op", "1password") and op_sub is not None:
