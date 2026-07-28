@@ -569,6 +569,30 @@ function Resolve-UvCmd {
     throw "uv is not installed. Run install.ps1 -Stage uv first."
 }
 
+function Test-UvPythonUsable {
+    # True when the interpreter `uv python find` reported actually exists and
+    # runs.  `uv python find` answers from the managed-install layout, so an
+    # interrupted download leaves the version directory in place (python311.dll,
+    # Lib\, Scripts\, pythonw.exe) WITHOUT python.exe and uv keeps reporting that
+    # phantom path.  Accepting it made the venv stage run `uv venv venv --python
+    # 3.11` against a missing interpreter and die with exit 2 -- with a real
+    # fallback (3.12) sitting right there unused (issue #73333).
+    param([object]$Found)
+
+    # `uv python find` prints one line, but a native command's output arrives as
+    # a string[] when anything extra slips onto stdout.
+    $candidate = ($Found | Where-Object { $_ -and "$_".Trim() } | Select-Object -Last 1)
+    if (-not $candidate) { return $false }
+    $candidate = "$candidate".Trim()
+    if (-not (Test-Path -LiteralPath $candidate)) { return $false }
+    try {
+        $null = & $candidate --version 2>$null
+        return ($LASTEXITCODE -eq 0)
+    } catch {
+        return $false
+    }
+}
+
 function Resolve-AvailablePythonVersion {
     # Return the first Python minor version uv can actually find, preferring the
     # requested $PythonVersion and then $PythonFallbackVersions.  Returns $null
@@ -581,6 +605,10 @@ function Resolve-AvailablePythonVersion {
     # survive into the ``venv`` stage's process -- there $PythonVersion is back
     # at its "3.11" default.  Consumers re-resolve here instead of trusting that
     # default, which is exactly the propagation gap behind issue #50769.
+    #
+    # A candidate only counts when its interpreter is actually usable: a broken
+    # managed install still answers `uv python find` but cannot back a venv
+    # (issue #73333), and skipping it here is what lets a healthy fallback win.
     $candidates = @($PythonVersion) + $PythonFallbackVersions
     $seen = @{}
     foreach ($ver in $candidates) {
@@ -588,7 +616,7 @@ function Resolve-AvailablePythonVersion {
         $seen[$ver] = $true
         try {
             $found = & $UvCmd python find $ver 2>$null
-            if ($found) { return $ver }
+            if (Test-UvPythonUsable $found) { return $ver }
         } catch { }
     }
     return $null
@@ -597,16 +625,18 @@ function Resolve-AvailablePythonVersion {
 function Test-Python {
     Write-Info "Checking Python $PythonVersion..."
     
-    # Let uv find or install Python
+    # Let uv find or install Python.  A find that resolves to an unusable
+    # interpreter (interrupted managed download) is treated as "not found" so we
+    # fall through to the install/repair and fallback paths below (#73333).
     try {
         $pythonPath = & $UvCmd python find $PythonVersion 2>$null
-        if ($pythonPath) {
+        if (Test-UvPythonUsable $pythonPath) {
             $ver = & $pythonPath --version 2>$null
             Write-Success "Python found: $ver"
             return $true
         }
     } catch { }
-    
+
     # Python not found -- use uv to install it (no admin needed!)
     Write-Info "Python $PythonVersion not found, installing via uv..."
     # Capture EAP outside the try block so the catch's restore call always
@@ -631,7 +661,7 @@ function Test-Python {
         # Check if Python is now available (more reliable than exit code
         # since uv may return non-zero due to "already installed" etc.)
         $pythonPath = & $UvCmd python find $PythonVersion 2>$null
-        if ($pythonPath) {
+        if (Test-UvPythonUsable $pythonPath) {
             $ver = & $pythonPath --version 2>$null
             Write-Success "Python installed: $ver"
             return $true
@@ -653,7 +683,7 @@ function Test-Python {
     foreach ($fallbackVer in $PythonFallbackVersions) {
         try {
             $pythonPath = & $UvCmd python find $fallbackVer 2>$null
-            if ($pythonPath) {
+            if (Test-UvPythonUsable $pythonPath) {
                 $ver = & $pythonPath --version 2>$null
                 Write-Success "Found fallback: $ver"
                 $script:PythonVersion = $fallbackVer
