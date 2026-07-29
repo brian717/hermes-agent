@@ -1278,6 +1278,19 @@ class TestBedrockContextLength:
         assert get_bedrock_context_length("global.anthropic.claude-fable-5") == 1_000_000
         assert get_bedrock_context_length("anthropic.claude-fable-5-v1:0") == 1_000_000
 
+    def test_claude_opus_5(self):
+        from agent.bedrock_adapter import get_bedrock_context_length
+        # Opus 5 is a 1M-context model. DEFAULT_CONTEXT_LENGTHS maps
+        # claude-opus-5 -> 1M, but the Bedrock resolution path short-circuits
+        # to this table before consulting it, so without an entry here every
+        # Opus 5 inference profile fell through to
+        # BEDROCK_DEFAULT_CONTEXT_LENGTH (128K) and the compressor compacted
+        # ~8x too early.
+        assert get_bedrock_context_length("anthropic.claude-opus-5") == 1_000_000
+        assert get_bedrock_context_length("eu.anthropic.claude-opus-5") == 1_000_000
+        assert get_bedrock_context_length("global.anthropic.claude-opus-5") == 1_000_000
+        assert get_bedrock_context_length("anthropic.claude-opus-5-20260101-v1:0") == 1_000_000
+
     def test_claude_opus_4_base_stays_200k(self):
         from agent.bedrock_adapter import get_bedrock_context_length
         # The original Opus 4 (no minor version) keeps the 200K window.
@@ -1332,6 +1345,39 @@ class TestBedrockContextLength:
         with patch("agent.bedrock_adapter.probe_bedrock_context_length") as mock_probe:
             assert get_bedrock_context_length("anthropic.claude-opus-4-6") == 1_000_000
             mock_probe.assert_not_called()
+
+    def test_every_1m_claude_entry_has_a_bedrock_counterpart(self):
+        """BEDROCK_CONTEXT_LENGTHS must not lag DEFAULT_CONTEXT_LENGTHS.
+
+        The Bedrock branch of get_model_context_length() short-circuits to the
+        Bedrock table, so a Claude model that DEFAULT_CONTEXT_LENGTHS knows is
+        1M but the Bedrock table omits silently reports the 128K catch-all.
+        That is how the whole -5 generation regressed; this guard makes the
+        next generation fail loudly instead.
+        """
+        from agent.bedrock_adapter import get_bedrock_context_length
+        from agent.model_metadata import DEFAULT_CONTEXT_LENGTHS
+
+        # DEFAULT_CONTEXT_LENGTHS carries both dotted and dashed spellings
+        # ("claude-opus-4.8" / "claude-opus-4-8"); Bedrock IDs only ever use
+        # dashes, so normalise before comparing.
+        expected = {
+            slug.replace(".", "-")
+            for slug, ctx in DEFAULT_CONTEXT_LENGTHS.items()
+            if slug.startswith("claude") and ctx == 1_000_000
+        }
+        assert expected, "DEFAULT_CONTEXT_LENGTHS lost its 1M Claude entries"
+
+        missing = {
+            slug
+            for slug in expected
+            if get_bedrock_context_length(f"anthropic.{slug}") != 1_000_000
+        }
+        assert not missing, (
+            "BEDROCK_CONTEXT_LENGTHS is missing 1M entries for "
+            f"{sorted(missing)} — those models fall through to the 128K "
+            "default and the compressor compacts far too early"
+        )
 
 
 class TestBedrockContextProbe:
