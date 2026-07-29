@@ -144,6 +144,11 @@ DEFAULT_EXCLUDES = [
 # Git subprocess timeout (seconds).
 _GIT_TIMEOUT: int = max(10, min(60, env_int("HERMES_CHECKPOINT_TIMEOUT", 30)))
 
+# How old an abandoned ``<index>.lock`` must be before we reclaim it without
+# proof that its writer is dead.  The longest timeout we ever hand git is
+# ``_GIT_TIMEOUT * 3``, so anything older cannot belong to a live command.
+_INDEX_LOCK_STALE_AFTER: float = max(float(_GIT_TIMEOUT * 3), 300.0)
+
 # Max files to snapshot — skip huge directories to avoid slowdowns.
 _MAX_FILES = 50_000
 
@@ -222,6 +227,81 @@ def _shadow_repo_path(working_dir: str) -> Path:  # pragma: no cover — kept fo
 
 def _index_path(store: Path, dir_hash: str) -> Path:
     return store / _INDEXES_DIRNAME / dir_hash
+
+
+def _index_lock_path(index_file: Path) -> Path:
+    """Path of the ``<index>.lock`` git creates while writing an index."""
+    return index_file.with_name(index_file.name + ".lock")
+
+
+def _discard_index_lock(
+    index_file: Optional[Path],
+    *,
+    min_age: Optional[float] = None,
+) -> bool:
+    """Reclaim a ``<index>.lock`` abandoned by a git process that is gone.
+
+    Git writes the per-project index through ``<index>.lock`` and renames it
+    into place on success.  A git that is killed — by our own subprocess
+    timeout, or by the machine going down mid-snapshot — never gets to clean
+    up, and because the index path is derived from a stable project hash the
+    orphan blocks *every* later checkpoint for that project with
+    ``fatal: Unable to create '...lock': File exists``, in this session and
+    all future ones.
+
+    ``min_age`` gates removal on the lock's mtime and should be passed
+    whenever we cannot prove the writer is dead; pass ``None`` only right
+    after we killed the holder ourselves.  Either way ownership is taken with
+    an atomic rename and confirmed by identity, so a lock that a live writer
+    substituted in between the stat and the rename is put back rather than
+    destroyed.
+
+    Returns True if a lock was removed.  Never raises — checkpointing is
+    best-effort and must not break the turn.
+    """
+    if index_file is None:
+        return False
+    lock = _index_lock_path(index_file)
+    try:
+        before = lock.stat()
+    except OSError:
+        return False  # no lock, or we cannot see it — nothing to reclaim
+
+    if min_age is not None and (time.time() - before.st_mtime) < min_age:
+        return False  # recent enough that a live git may still hold it
+
+    claimed = lock.with_name(f"{lock.name}.abandoned-{os.getpid()}")
+    try:
+        # Atomic on a single filesystem: either we move the file that is there
+        # right now, or it is already gone.  On Windows this also fails
+        # outright while a writer still holds the handle open, which is
+        # exactly the outcome we want.
+        os.replace(lock, claimed)
+    except OSError:
+        return False
+
+    try:
+        after = claimed.stat()
+        same_file = (after.st_dev, after.st_ino) == (before.st_dev, before.st_ino)
+    except OSError:
+        same_file = False
+
+    if not same_file:
+        # A writer replaced the lock between our stat and our rename, so what
+        # we grabbed is theirs.  Put it back instead of unlinking it.
+        try:
+            os.replace(claimed, lock)
+        except OSError:
+            pass
+        return False
+
+    try:
+        claimed.unlink()
+    except OSError:
+        return False
+
+    logger.warning("Removed abandoned checkpoint index lock: %s", lock)
+    return True
 
 
 def _ref_name(dir_hash: str) -> str:
@@ -349,6 +429,11 @@ def _run_git(
     except subprocess.TimeoutExpired:
         msg = f"git timed out after {timeout}s: {' '.join(cmd)}"
         logger.error(msg, exc_info=True)
+        # subprocess.run has already killed the child, so any lock on our
+        # index is orphaned by definition — a live git could not have created
+        # one while ours held it.  Drop it now or every later checkpoint for
+        # this project fails instantly on "File exists", forever.
+        _discard_index_lock(index_file)
         return False, "", msg
     except FileNotFoundError as exc:
         missing_target = getattr(exc, "filename", None)
@@ -1010,6 +1095,11 @@ class CheckpointManager:
         dir_hash = _project_hash(working_dir)
         index_file = _index_path(store, dir_hash)
         ref = _ref_name(dir_hash)
+
+        # Self-heal a lock left behind before this process existed — a crash,
+        # a hard kill, or a timeout from an older build that did not clean up.
+        # Age-gated, since we cannot prove that writer is gone.
+        _discard_index_lock(index_file, min_age=_INDEX_LOCK_STALE_AFTER)
 
         # Seed the per-project index from the last checkpoint, if any, so the
         # diff/commit machinery sees only changes since then.  On first call,

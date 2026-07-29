@@ -13,6 +13,10 @@ from unittest.mock import patch
 
 from tools.checkpoint_manager import (
     CheckpointManager,
+    _INDEX_LOCK_STALE_AFTER,
+    _discard_index_lock,
+    _index_lock_path,
+    _index_path,
     _shadow_repo_path,
     _init_shadow_repo,
     _init_store,
@@ -1466,3 +1470,104 @@ class TestSessionDiff:
         assert result["success"] is True
         assert result.get("empty") is True
         assert result["diff"] == ""
+
+
+# =========================================================================
+# Abandoned index locks (#74108)
+# =========================================================================
+
+def _abandon_lock(index_file: Path, age: float) -> Path:
+    """Drop a zero-byte ``<index>.lock`` aged ``age`` seconds into the past.
+
+    This is exactly what git leaves behind when it is killed between creating
+    the lock and renaming it over the index.
+    """
+    lock = _index_lock_path(index_file)
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    lock.write_bytes(b"")
+    stamp = time.time() - age
+    os.utime(lock, (stamp, stamp))
+    return lock
+
+
+class TestAbandonedIndexLock:
+    """A lock orphaned by a killed git must not wedge checkpoints forever.
+
+    Reported in #74108: on a slow (drvfs/9p) working directory ``git add -A``
+    blew past the subprocess timeout, and the lock the killed git left behind
+    made every later checkpoint — in that session and in all future ones —
+    fail instantly with ``Unable to create '...lock': File exists``.
+    """
+
+    def _index_for(self, work_dir) -> Path:
+        return _index_path(_store_path(), _project_hash(str(work_dir)))
+
+    def test_stale_lock_does_not_wedge_later_checkpoints(self, mgr, work_dir):
+        """The regression: a leftover lock must self-heal, not block forever."""
+        assert mgr.ensure_checkpoint(str(work_dir), "baseline") is True
+        index_file = self._index_for(work_dir)
+        assert index_file.exists()
+
+        lock = _abandon_lock(index_file, age=_INDEX_LOCK_STALE_AFTER + 60)
+
+        mgr.new_turn()
+        (work_dir / "main.py").write_text("print('v2')\n")
+        assert mgr.ensure_checkpoint(str(work_dir), "after edit") is True
+        assert not lock.exists()
+        assert len(mgr.list_checkpoints(str(work_dir))) == 2
+
+    def test_stale_lock_recovers_across_processes(self, mgr, work_dir):
+        """Recovery must not depend on this process having created the lock."""
+        assert mgr.ensure_checkpoint(str(work_dir), "baseline") is True
+        index_file = self._index_for(work_dir)
+        _abandon_lock(index_file, age=_INDEX_LOCK_STALE_AFTER + 3600)
+
+        # A brand-new manager stands in for a later Hermes run: the lock on
+        # disk predates it entirely, which is the "until removed by hand"
+        # case in the report.
+        fresh = CheckpointManager(enabled=True, max_snapshots=50)
+        (work_dir / "main.py").write_text("print('v3')\n")
+        assert fresh.ensure_checkpoint(str(work_dir), "next session") is True
+
+    def test_recent_lock_is_left_alone(self, mgr, work_dir):
+        """A lock a live git may still hold is never reclaimed on age alone."""
+        mgr.ensure_checkpoint(str(work_dir), "baseline")
+        index_file = self._index_for(work_dir)
+        lock = _abandon_lock(index_file, age=1.0)
+
+        assert _discard_index_lock(index_file, min_age=_INDEX_LOCK_STALE_AFTER) is False
+        assert lock.exists()
+
+    def test_timeout_drops_the_lock_it_orphaned(self, tmp_path):
+        """On TimeoutExpired the holder is dead, so age must not gate cleanup."""
+        store = tmp_path / "store"
+        index_file = store / "indexes" / "deadbeef"
+        lock = _abandon_lock(index_file, age=0.0)
+
+        with patch(
+            "subprocess.run",
+            side_effect=subprocess.TimeoutExpired(cmd=["git", "add", "-A"], timeout=60),
+        ):
+            ok, _, err = _run_git(
+                ["add", "-A"], store, str(tmp_path), index_file=index_file,
+            )
+
+        assert ok is False
+        assert "timed out" in err
+        assert not lock.exists()
+
+    def test_no_lock_is_a_noop(self, tmp_path):
+        index_file = tmp_path / "indexes" / "deadbeef"
+        index_file.parent.mkdir(parents=True)
+        assert _discard_index_lock(index_file) is False
+        assert _discard_index_lock(None) is False
+        # No ".abandoned-<pid>" scratch file may survive a no-op.
+        assert list(index_file.parent.iterdir()) == []
+
+    def test_reclaim_leaves_no_scratch_file(self, tmp_path):
+        index_file = tmp_path / "indexes" / "deadbeef"
+        lock = _abandon_lock(index_file, age=0.0)
+
+        assert _discard_index_lock(index_file) is True
+        assert not lock.exists()
+        assert list(index_file.parent.iterdir()) == []
