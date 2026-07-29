@@ -11521,6 +11521,13 @@ def _write_update_planned_stop_marker(profile_path: Path, pid: int) -> bool:
         return False
 
 
+# Upper bound (seconds) on how long the update waits for a *force-stopped*
+# gateway to actually leave the process table. Kill teardown is normally
+# sub-second; this only caps the pathological case so a wedged process cannot
+# stall `hermes update` for the full restart-drain timeout.
+_FORCE_STOP_EXIT_TIMEOUT = 5.0
+
+
 def _wait_for_windows_update_gateway_exit(
     pids: list[int], *, timeout: float
 ) -> set[int]:
@@ -11847,10 +11854,34 @@ def _pause_windows_gateways_for_update() -> dict | None:
         except (ProcessLookupError, PermissionError, OSError):
             pass
 
+    # A force stop only *queues* the kill: on Windows TerminateProcess returns
+    # immediately while the kernel is still tearing the target down, and the
+    # dying process keeps its native .pyd extensions mapped until it is gone.
+    # Returning here would race that teardown — the venv-holder guard right
+    # after this call can still see the gateway we just killed, and the
+    # dependency sync can still die with "Access is denied. (os error 5)"
+    # renaming cryptography's _rust.pyd (#73684). Wait for the killed PIDs to
+    # actually disappear; the wait is bounded so a wedged process cannot hang
+    # the update.
+    stubborn: set[int] = set()
+    if force_killed:
+        stubborn = _wait_for_windows_update_gateway_exit(
+            force_killed,
+            timeout=min(drain_timeout, _FORCE_STOP_EXIT_TIMEOUT),
+        )
+
     if profiles:
         print(f"  ✓ Paused gateway profile(s): {', '.join(sorted(profiles))}")
     if force_killed:
         print(f"  → Force-stopped {len(force_killed)} gateway process(es)")
+    if stubborn:
+        stubborn_sorted = sorted(stubborn)
+        pid_list = ", ".join(str(pid) for pid in stubborn_sorted)
+        pid_args = " ".join(f"/PID {pid}" for pid in stubborn_sorted)
+        print(f"  ⚠ Gateway PID(s) still alive after force-stop: {pid_list}")
+        print("    They may still hold native extension (.pyd) files locked, so")
+        print("    the dependency sync can fail with an access-denied error.")
+        print(f"    Terminate them and retry:  taskkill /F {pid_args}")
 
     if unmapped_pids:
         respawnable = sum(1 for u in unmapped if u.get("argv"))

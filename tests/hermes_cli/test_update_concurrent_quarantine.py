@@ -508,7 +508,10 @@ def test_pause_windows_gateways_for_update_stops_profile_and_unmapped_pids(
             }
         ],
     }
-    assert waited_for == [101]
+    # 101 is waited on for its graceful drain; 202 is force-stopped and then
+    # waited on again so its .pyd handles are released before the update
+    # mutates the venv (#73684).
+    assert waited_for == [101, 202]
     assert terminated == [(202, True)]
 
     marker = json.loads((profile_home / ".gateway-planned-stop.json").read_text())
@@ -521,6 +524,88 @@ def test_pause_windows_gateways_for_update_stops_profile_and_unmapped_pids(
     # An unmapped PID whose argv we captured is respawnable, so we must NOT
     # tell the user to restart it manually.
     assert "Restart manually after update" not in captured
+
+
+@patch.object(cli_main, "_is_windows", return_value=True)
+def test_pause_waits_for_force_stopped_pids_to_actually_exit(
+    _winp,
+    monkeypatch,
+):
+    """Issue #73684 — a force stop must be confirmed, not fired and forgotten.
+
+    ``terminate_pid(force=True)`` only queues the kill; the target keeps its
+    native ``.pyd`` extensions mapped until the OS finishes tearing it down.
+    Returning before that happens lets the dependency sync race the teardown
+    and fail with ``Access is denied. (os error 5)``.
+    """
+    import gateway.status as status_mod
+    import hermes_cli.gateway as gateway_mod
+
+    monkeypatch.setattr(gateway_mod, "find_gateway_pids", lambda **_k: [303])
+    monkeypatch.setattr(
+        gateway_mod, "find_profile_gateway_processes", lambda **_k: []
+    )
+    monkeypatch.setattr(gateway_mod, "_get_restart_drain_timeout", lambda: 30.0)
+    monkeypatch.setattr(gateway_mod, "_capture_gateway_argv", lambda pid: None)
+
+    call_order = []
+    monkeypatch.setattr(
+        status_mod,
+        "terminate_pid",
+        lambda pid, force=False: call_order.append(("kill", int(pid))),
+    )
+
+    waits = []
+
+    def fake_wait(pids, *, timeout):
+        # Mirror the real helper's early return so the no-op call for the
+        # (empty) mapped-PID drain does not show up in call_order.
+        if not pids:
+            return set()
+        waits.append((list(pids), timeout))
+        call_order.append(("wait", list(pids)))
+        return set()
+
+    monkeypatch.setattr(cli_main, "_wait_for_windows_update_gateway_exit", fake_wait)
+
+    cli_main._pause_windows_gateways_for_update()
+
+    # The kill must be followed by a wait on the very PID we killed.
+    assert call_order == [("kill", 303), ("wait", [303])]
+    # ...and that wait is bounded, not the full (configurable) drain timeout.
+    assert waits[-1][1] == cli_main._FORCE_STOP_EXIT_TIMEOUT
+
+
+@patch.object(cli_main, "_is_windows", return_value=True)
+def test_pause_warns_when_force_stopped_pid_refuses_to_die(
+    _winp,
+    monkeypatch,
+    capsys,
+):
+    """A PID that outlives its force stop is named, not silently ignored."""
+    import gateway.status as status_mod
+    import hermes_cli.gateway as gateway_mod
+
+    monkeypatch.setattr(gateway_mod, "find_gateway_pids", lambda **_k: [404])
+    monkeypatch.setattr(
+        gateway_mod, "find_profile_gateway_processes", lambda **_k: []
+    )
+    monkeypatch.setattr(gateway_mod, "_get_restart_drain_timeout", lambda: 1.0)
+    monkeypatch.setattr(gateway_mod, "_capture_gateway_argv", lambda pid: None)
+    monkeypatch.setattr(
+        status_mod, "terminate_pid", lambda pid, force=False: None
+    )
+    monkeypatch.setattr(
+        cli_main,
+        "_wait_for_windows_update_gateway_exit",
+        lambda pids, *, timeout: {404} if 404 in pids else set(),
+    )
+
+    cli_main._pause_windows_gateways_for_update()
+
+    out = capsys.readouterr().out
+    assert "still alive after force-stop: 404" in out
+    assert "taskkill /F /PID 404" in out
 
 
 @patch.object(cli_main, "_is_windows", return_value=True)
