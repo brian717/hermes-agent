@@ -1465,6 +1465,38 @@ class _CuaDriverSession:
         )
 
     @staticmethod
+    def _is_call_timeout(exc: Exception) -> bool:
+        """Return True when the bridge gave up waiting for a tool call.
+
+        ``_AsyncBridge.run`` waits on ``fut.result(timeout=...)``, which
+        raises ``concurrent.futures.TimeoutError``. That name is an alias of
+        the builtin ``TimeoutError`` on the Python versions we support (as is
+        ``asyncio.TimeoutError``), but the aliasing is an implementation
+        detail of the stdlib rather than a guarantee callers should encode, so
+        name all three.
+        """
+        return isinstance(
+            exc, (TimeoutError, concurrent.futures.TimeoutError, asyncio.TimeoutError)
+        )
+
+    def _recycle_timed_out_session(self) -> None:
+        """Rebuild the session after a timed-out call left it half-open.
+
+        A failed rebuild must not mask the timeout the caller is about to
+        see, so swallow it here: ``_restart_session_locked`` clears
+        ``_started`` before respawning, so an unsuccessful restart leaves the
+        session marked dead and the next ``call_tool`` starts a fresh one via
+        its not-started guard.
+        """
+        with self._lock:
+            try:
+                self._restart_session_locked()
+            except Exception as e:
+                logger.warning(
+                    "cua-driver session restart after timeout failed: %s", e
+                )
+
+    @staticmethod
     def _is_closed_session_error(exc: Exception) -> bool:
         """Return True for MCP/stdio failures that are recoverable by reconnecting."""
         name = exc.__class__.__name__
@@ -1670,6 +1702,22 @@ class _CuaDriverSession:
                 timeout=timeout,
             )
         except Exception as e:
+            if self._is_call_timeout(e):
+                # The abandoned coroutine still owns the bridge request, so the
+                # session is half-open: without a restart every later call in
+                # the run fails against it with an error unrelated to the
+                # original wait (#74799). Recycle, then raise a named error
+                # rather than replaying — the call may simply be slow, and a
+                # retry would double the wait the caller already spent.
+                logger.warning(
+                    "cua-driver MCP timed out on %s after %.1fs; recycling the session",
+                    name, timeout,
+                )
+                self._recycle_timed_out_session()
+                raise RuntimeError(
+                    f"cua-driver MCP timed out on {name} after {timeout:.1f}s; "
+                    "the session was recycled"
+                ) from e
             if self._is_transient_daemon_error(e):
                 logger.warning(
                     "cua-driver MCP transport failed on %s (%s); "
