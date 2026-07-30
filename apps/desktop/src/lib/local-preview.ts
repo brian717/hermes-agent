@@ -1,4 +1,4 @@
-import { isDesktopFsRemoteMode, readDesktopFileText } from '@/lib/desktop-fs'
+import { isDesktopFsRemoteMode, readDesktopFileDataUrl, readDesktopFileText } from '@/lib/desktop-fs'
 import type { PreviewTarget } from '@/store/preview'
 
 const HTML_EXTENSIONS = new Set(['.htm', '.html'])
@@ -127,6 +127,61 @@ async function enrichPreviewTarget(target: PreviewTarget | null): Promise<Previe
   } catch {
     return target
   }
+}
+
+function base64ToBytes(base64: string) {
+  const binary = atob(base64)
+  const bytes = new Uint8Array(binary.length)
+
+  for (let i = 0; i < binary.length; i += 1) {
+    bytes[i] = binary.charCodeAt(i)
+  }
+
+  return bytes
+}
+
+/** A path the client OS can actually resolve. Mirrors the artifact pane's
+ *  `openHtmlInBrowser`: a saved temp file, not the renderer's encoded form. */
+function clientPathToFileUrl(path: string) {
+  const normalized = path.replace(/\\/g, '/')
+
+  return `file://${normalized.startsWith('/') ? '' : '/'}${normalized}`
+}
+
+/**
+ * URL to hand the client's OS for "open in browser".
+ *
+ * In remote (SSH) mode a file target's `url` is a `file://` URL built from a
+ * path on the *backend* host, so `shell.openExternal` on the client resolves
+ * nothing and Electron reports "No application found to open URL" (#75011).
+ * Fetch the bytes through the FS API and stage them in a client-side temp file
+ * first — the same trick the artifact pane uses for generated HTML. Relative
+ * assets are not fetched, so a page that pulls in siblings renders bare; that
+ * still beats a dead-end toast.
+ */
+export async function browserPreviewUrl(target: PreviewTarget): Promise<string> {
+  if (!isDesktopFsRemoteMode() || target.kind !== 'file') {
+    return target.url
+  }
+
+  const path = target.path || target.source
+  const dataUrl = await readDesktopFileDataUrl(path)
+  const separator = dataUrl.indexOf(',')
+
+  if (separator < 0 || !/;base64$/i.test(dataUrl.slice(0, separator))) {
+    throw new Error('Could not read the file from the remote backend')
+  }
+
+  const saved = await window.hermesDesktop?.saveImageBuffer?.(
+    base64ToBytes(dataUrl.slice(separator + 1)),
+    extension(path) || '.txt'
+  )
+
+  if (!saved) {
+    throw new Error('Could not stage the remote file for preview')
+  }
+
+  return clientPathToFileUrl(saved)
 }
 
 export async function normalizeOrLocalPreviewTarget(

@@ -6,7 +6,7 @@ import { Button } from '@/components/ui/button'
 import { Codicon } from '@/components/ui/codicon'
 import { Tip } from '@/components/ui/tooltip'
 import { useI18n } from '@/i18n'
-import { normalizeOrLocalPreviewTarget } from '@/lib/local-preview'
+import { browserPreviewUrl, normalizeOrLocalPreviewTarget } from '@/lib/local-preview'
 import { cn } from '@/lib/utils'
 import { PREVIEW_PANE_ID } from '@/store/layout'
 import { notifyError } from '@/store/notifications'
@@ -67,7 +67,9 @@ export const PreviewStatusRow = memo(function PreviewStatusRow({ item, onDismiss
         throw new Error('Desktop preview browser bridge is unavailable')
       }
 
-      await bridge((await resolveTarget()).url)
+      // Not target.url: over a remote backend that path only exists on the
+      // other host, so it has to be staged locally first (#75011).
+      await bridge(await browserPreviewUrl(await resolveTarget()))
     } catch (error) {
       notifyError(error, t.preview.unavailable)
     }
