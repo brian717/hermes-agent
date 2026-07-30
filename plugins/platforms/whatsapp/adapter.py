@@ -1503,8 +1503,13 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             reply_to_message_id = None
             reply_to_author_id = None
             reply_to_is_own_message = False
-            if data.get("hasQuotedMessage"):
-                raw_reply_id = data.get("quotedMessageId")
+            # A quote id alone is enough to know this is a reply. Baileys can
+            # deliver ``stanzaId``/``participant`` without the inline quoted
+            # payload, which leaves ``hasQuotedMessage`` false; gating on that
+            # flag alone dropped a known referent and handed the agent a bare
+            # command it could attach to the wrong prior message.
+            raw_reply_id = data.get("quotedMessageId")
+            if data.get("hasQuotedMessage") or raw_reply_id:
                 if raw_reply_id is not None:
                     reply_to_message_id = str(raw_reply_id)
                 quoted_participant = self._normalize_whatsapp_id(data.get("quotedParticipant"))

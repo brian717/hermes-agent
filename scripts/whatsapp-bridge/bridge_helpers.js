@@ -313,7 +313,10 @@ export async function extractBridgeEvent({
   const quotedMessageId = contextInfo?.stanzaId || null;
   const quotedParticipant = normalizeWhatsAppId(contextInfo?.participant || '') || null;
   const quotedRemoteJid = normalizeWhatsAppId(contextInfo?.remoteJid || '') || null;
-  const hasQuotedMessage = !!contextInfo?.quotedMessage;
+  // A stanza id without an inline `quotedMessage` body is still a reply —
+  // report it as one so the adapter keeps the reply relation instead of
+  // handing the agent a referent-less command.
+  const hasQuotedMessage = !!(contextInfo?.quotedMessage || quotedMessageId);
   const quotedText = textFromQuotedMessage(contextInfo?.quotedMessage);
 
   let body = '';

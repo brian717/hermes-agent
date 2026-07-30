@@ -216,6 +216,65 @@ class TestBridgeEventMetadata:
         assert event.raw_message["quotedRemoteJid"] == "15551234567@s.whatsapp.net"
         assert event.raw_message["hasQuotedMessage"] is True
 
+    @pytest.mark.asyncio
+    async def test_reply_relation_survives_stanza_id_only_quote(self):
+        """A quote id without the inline quoted payload is still a reply.
+
+        Baileys can deliver ``contextInfo.stanzaId``/``participant`` while
+        omitting the inline ``quotedMessage`` body, so the bridge reports
+        ``hasQuotedMessage: false``. Gating the reply fields on that flag alone
+        discarded a known referent and left the agent with a bare command such
+        as ``send it``, which it could then attach to the wrong prior message.
+        """
+        adapter = _make_adapter()
+        data = {
+            "messageId": "incoming-msg",
+            "chatId": "15551234567@s.whatsapp.net",
+            "senderId": "15551234567@s.whatsapp.net",
+            "senderName": "Tester",
+            "chatName": "Tester",
+            "isGroup": False,
+            "body": "send it",
+            "hasMedia": False,
+            "mediaUrls": [],
+            "quotedMessageId": "outbound-msg",
+            "quotedParticipant": "99999999999@s.whatsapp.net",
+            "quotedRemoteJid": "15551234567@s.whatsapp.net",
+            "hasQuotedMessage": False,
+        }
+
+        event = await adapter._build_message_event(data)
+
+        assert event is not None
+        assert event.reply_to_message_id == "outbound-msg"
+        assert event.reply_to_author_id == "99999999999@s.whatsapp.net"
+
+    @pytest.mark.asyncio
+    async def test_no_quote_metadata_leaves_reply_fields_unset(self):
+        """An ordinary, non-reply message must not gain a reply relation."""
+        adapter = _make_adapter()
+        data = {
+            "messageId": "incoming-msg",
+            "chatId": "15551234567@s.whatsapp.net",
+            "senderId": "15551234567@s.whatsapp.net",
+            "senderName": "Tester",
+            "chatName": "Tester",
+            "isGroup": False,
+            "body": "hello",
+            "hasMedia": False,
+            "mediaUrls": [],
+            "quotedMessageId": None,
+            "quotedParticipant": "",
+            "hasQuotedMessage": False,
+        }
+
+        event = await adapter._build_message_event(data)
+
+        assert event is not None
+        assert event.reply_to_message_id is None
+        assert event.reply_to_author_id is None
+        assert event.reply_to_is_own_message is False
+
 
 # ---------------------------------------------------------------------------
 # display_config tier classification

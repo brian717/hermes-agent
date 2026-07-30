@@ -129,6 +129,62 @@ import {
   console.log('  ✓ inbound quoted metadata includes quoted text');
 }
 
+// -- stanza-id-only quote (no inline quotedMessage payload) ----------------
+{
+  const event = await extractBridgeEvent({
+    msg: {
+      key: {
+        id: 'incoming-2',
+        remoteJid: '15551234567@s.whatsapp.net',
+        participant: '15550001111@s.whatsapp.net',
+        fromMe: false,
+      },
+      pushName: 'Tester',
+      messageTimestamp: 123,
+      message: {
+        extendedTextMessage: {
+          text: '/queue send it',
+          contextInfo: {
+            stanzaId: 'outbound-2',
+            participant: '15559998888@s.whatsapp.net',
+            remoteJid: '15551234567@s.whatsapp.net',
+          },
+        },
+      },
+    },
+    chatId: '15551234567@s.whatsapp.net',
+    senderId: '15550001111@s.whatsapp.net',
+    senderNumber: '15550001111',
+    botIds: ['15559998888@s.whatsapp.net'],
+    downloadMedia: async () => Buffer.from(''),
+  });
+
+  assert.equal(event.quotedMessageId, 'outbound-2');
+  assert.equal(event.quotedParticipant, '15559998888@s.whatsapp.net');
+  assert.equal(event.quotedText, '');
+  assert.equal(event.hasQuotedMessage, true);
+  console.log('  ✓ stanza-id-only quote still reports a quoted message');
+}
+
+// -- ordinary message keeps no quote relation -----------------------------
+{
+  const event = await extractBridgeEvent({
+    msg: {
+      key: { id: 'incoming-3', remoteJid: '15551234567@s.whatsapp.net', fromMe: false },
+      messageTimestamp: 123,
+      message: { conversation: 'hello' },
+    },
+    chatId: '15551234567@s.whatsapp.net',
+    senderId: '15550001111@s.whatsapp.net',
+    senderNumber: '15550001111',
+    downloadMedia: async () => Buffer.from(''),
+  });
+
+  assert.equal(event.quotedMessageId, null);
+  assert.equal(event.hasQuotedMessage, false);
+  console.log('  ✓ non-reply message reports no quoted message');
+}
+
 {
   const event = await extractBridgeEvent({
     msg: {
