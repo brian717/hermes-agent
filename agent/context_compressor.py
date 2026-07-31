@@ -4235,11 +4235,23 @@ This compaction should PRIORITISE preserving all information related to the focu
         start: int,
         end: int,
     ) -> list[tuple[int, str]]:
-        """Find handoff summaries inside a compression window."""
+        """Find handoff summaries inside a compression window.
+
+        The window bounds come from boundary math that can overshoot the list
+        (#75588), so clamp them to the rows that actually exist.  This is a
+        read-only probe run inside an active turn — a bad bound must narrow the
+        scan, never raise an ``IndexError`` out of the compression path.
+        """
         summaries: list[tuple[int, str]] = []
+        n = len(messages)
+        start = max(0, min(start, n))
+        end = max(start, min(end, n))
         for idx in range(start, end):
-            content = messages[idx].get("content")
-            if cls._is_context_summary_message(messages[idx]):
+            message = messages[idx]
+            if not isinstance(message, dict):
+                continue
+            content = message.get("content")
+            if cls._is_context_summary_message(message):
                 summaries.append((
                     idx,
                     cls._strip_summary_prefix(_content_text_for_contains(content)),
@@ -4895,6 +4907,18 @@ This compaction should PRIORITISE preserving all information related to the focu
         if token_budget is None:
             token_budget = self.tail_token_budget
         n = len(messages)
+        # An aligned head can swallow the whole list: a transcript ending in a
+        # tool-result run pushes ``_align_boundary_forward`` all the way to
+        # ``n``.  There is no compressible middle left to find, and without
+        # this guard the forward-progress floor below returns ``n + 1`` — an
+        # exclusive end past the end of the list.  Callers do not only slice
+        # with it (harmless); ``_resolve_compact_cursor`` and the summary scan
+        # *index* with it and raise ``IndexError`` straight out of the active
+        # turn (#75588).  ``n`` is the only valid exclusive end here, and it
+        # makes the callers' ``compress_start >= compress_end`` checks take
+        # their existing no-compressible-window path.
+        if head_end >= n:
+            return n
         # Hard minimum: always keep a bounded recent-message floor in the tail.
         # ``protect_last_n`` remains a minimum up to the cap; the cap avoids
         # preserving a whole run of bulky tool outputs on every compaction.
@@ -5005,7 +5029,13 @@ This compaction should PRIORITISE preserving all information related to the focu
         # exists to prevent.  Re-align FORWARD (never backward, which would give
         # the floor's message back) so a raised cut skips to the end of the
         # group and the whole call/result pair is summarised together.
-        return self._align_boundary_forward(messages, max(cut_idx, head_end + 1))
+        # ``head_end + 1`` is a floor, not a licence to point past the end.  The
+        # ``head_end >= n`` guard at the top of this method is what makes that
+        # impossible; the ``min`` keeps the invariant readable at the statement
+        # that actually produces the index every caller trusts (#75588).
+        return self._align_boundary_forward(
+            messages, min(n, max(cut_idx, head_end + 1))
+        )
 
     # ------------------------------------------------------------------
     # ContextEngine: manual /compress preflight
