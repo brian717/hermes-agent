@@ -415,7 +415,7 @@ class TestRuntimeRepair:
              ), \
              patch(
                  "hermes_cli.managed_uv._stage_candidate_venv",
-                 return_value=None,
+                 return_value=(None, "replacement environment failed dependency sync"),
              ):
             result = repair_vulnerable_runtime("uv", project_root=root)
 
@@ -490,7 +490,7 @@ class TestRuntimeRepair:
              ), \
              patch(
                  "hermes_cli.managed_uv._stage_candidate_venv",
-                 return_value=candidate_venv,
+                 return_value=(candidate_venv, ""),
              ), \
              patch(
                  "hermes_cli.managed_uv._smoke_candidate_venv",
@@ -892,7 +892,7 @@ class TestRepairRetriesAfterUvRefresh:
              ) as mock_refresh, \
              patch(
                  "hermes_cli.managed_uv._stage_candidate_venv",
-                 return_value=None,
+                 return_value=(None, "replacement environment failed dependency sync"),
              ):
             result = repair_vulnerable_runtime("uv", project_root=root)
         return result, attempts, mock_refresh, sentinel
@@ -983,4 +983,100 @@ class TestDefaultLiveVenv:
         assert _default_live_venv(root) == root / "venv"
         result = repair_vulnerable_runtime("uv", project_root=root)
         assert result.status == "not-applicable"
+
+
+# ---------------------------------------------------------------------------
+# _stage_candidate_venv — issue #75655
+# ---------------------------------------------------------------------------
+
+class TestStageCandidateVenv:
+    """The locked `uv sync` must resolve the way uv.lock was generated.
+
+    uv.lock is resolved with this project's ``[tool.uv]`` block, which sets
+    ``exclude-newer``. Suppressing config discovery drops that setting, uv
+    then re-resolves and calls the lockfile stale, and ``--locked`` makes it
+    a hard error — so the SQLite-3.50.4 replacement venv could never be
+    built and the failure was reported as a smoke-test failure that never
+    ran (#75655).
+    """
+
+    def _stage(self, tmp_path, *, sync_rc=0, smoke=(True, "", None)):
+        from hermes_cli import managed_uv
+
+        root, _live, _sentinel = _make_runtime_install(tmp_path)
+        (root / "uv.lock").write_text("# lock\n", encoding="utf-8")
+        generation = root / ".hermes-runtime" / "python" / "generation-test"
+        python = generation / "bin" / "python"
+        python.parent.mkdir(parents=True)
+        python.write_text("candidate interpreter", encoding="utf-8")
+
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append((list(cmd), kwargs.get("env") or {}))
+            rc = sync_rc if "sync" in cmd else 0
+            return SimpleNamespace(returncode=rc, stdout="", stderr="")
+
+        with patch.object(managed_uv.subprocess, "run", side_effect=fake_run), \
+             patch.object(
+                 managed_uv, "_smoke_candidate_venv", return_value=smoke
+             ):
+            candidate, detail = managed_uv._stage_candidate_venv(
+                "uv",
+                project_root=root,
+                generation=generation,
+                python=python,
+            )
+        sync = next(c for c in calls if "sync" in c[0])
+        venv = next(c for c in calls if "venv" in c[0])
+        return SimpleNamespace(
+            candidate=candidate, detail=detail, sync=sync, venv=venv
+        )
+
+    def test_locked_sync_does_not_pass_no_config_flag(self, tmp_path):
+        argv, _env = self._stage(tmp_path).sync
+        assert "--locked" in argv
+        assert "--no-config" not in argv, (
+            "--no-config drops [tool.uv] exclude-newer, which makes --locked "
+            "fail against a lockfile that is actually current"
+        )
+
+    def test_locked_sync_does_not_inherit_uv_no_config(self, tmp_path):
+        """The flag is only half of it — managed_python_env() exports
+        UV_NO_CONFIG=1, which suppresses the same config on its own."""
+        _argv, env = self._stage(tmp_path).sync
+        assert "UV_NO_CONFIG" not in env
+
+    def test_sync_keeps_the_candidate_scoped_environment(self, tmp_path):
+        """Clearing UV_NO_CONFIG must not leak the caller's interpreter."""
+        _argv, env = self._stage(tmp_path).sync
+        assert ".hermes-runtime" in env["UV_PYTHON_INSTALL_DIR"]
+        assert "venv-candidate-" in env["UV_PROJECT_ENVIRONMENT"]
+        assert "venv-candidate-" in env["VIRTUAL_ENV"]
+        assert env["UV_PYTHON_DOWNLOADS"] == "never"
+
+    def test_venv_creation_still_isolated_from_config(self, tmp_path):
+        """Only the lockfile-consuming call needs project config; venv
+        creation stays fully isolated."""
+        argv, env = self._stage(tmp_path).venv
+        assert "--no-config" in argv
+        assert env["UV_NO_CONFIG"] == "1"
+
+    def test_sync_failure_is_not_reported_as_a_smoke_failure(self, tmp_path):
+        staged = self._stage(tmp_path, sync_rc=2)
+        assert staged.candidate is None
+        assert "dependency sync" in staged.detail
+        assert "smoke" not in staged.detail, (
+            "smoke tests never ran — sync exits before _smoke_candidate_venv"
+        )
+
+    def test_smoke_failure_still_reports_smoke(self, tmp_path):
+        staged = self._stage(tmp_path, smoke=(False, "import failed", None))
+        assert staged.candidate is None
+        assert "smoke" in staged.detail
+
+    def test_success_returns_candidate_and_no_detail(self, tmp_path):
+        staged = self._stage(tmp_path)
+        assert staged.candidate is not None
+        assert staged.detail == ""
 

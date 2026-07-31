@@ -703,7 +703,14 @@ def _stage_candidate_venv(
     project_root: Path,
     generation: Path,
     python: Path,
-) -> Path | None:
+) -> tuple[Path | None, str]:
+    """Build the replacement venv.
+
+    Returns ``(candidate, "")`` on success, or ``(None, detail)`` naming the
+    stage that failed. The caller reports that detail verbatim, so staging
+    failures stay distinguishable instead of all reading as smoke failures
+    (#75655).
+    """
     runtime_root = project_root / _RUNTIME_DIR_NAME
     token = f"{int(time.time())}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
     candidate = runtime_root / f"venv-candidate-{token}"
@@ -744,12 +751,21 @@ def _stage_candidate_venv(
             (created.stderr or created.stdout or "").strip(),
         )
         _remove_tree(candidate, boundary=runtime_root)
-        return None
+        return None, "replacement environment could not be created"
 
     if not (project_root / "uv.lock").is_file():
         logger.warning("candidate dependency sync refused: uv.lock is missing")
         _remove_tree(candidate, boundary=runtime_root)
-        return None
+        return None, "replacement environment has no uv.lock to sync against"
+    # uv.lock was resolved with this project's [tool.uv] settings — notably
+    # ``exclude-newer``. Suppressing config discovery changes resolution, so
+    # uv judges the lockfile stale and --locked turns that into a hard error
+    # every single run (#75655). Both suppression channels have to go: the
+    # --no-config flag and the UV_NO_CONFIG that managed_python_env() exports.
+    # Isolation is preserved where it matters — the sanitized env still pins
+    # UV_PROJECT_ENVIRONMENT, UV_PYTHON* and VIRTUAL_ENV at the candidate.
+    sync_env = dict(env)
+    sync_env.pop("UV_NO_CONFIG", None)
     synced = subprocess.run(
         [
             uv_bin,
@@ -759,23 +775,22 @@ def _stage_candidate_venv(
             "--locked",
             "--python",
             str(_venv_python(candidate)),
-            "--no-config",
         ],
         cwd=project_root,
-        env=env,
+        env=sync_env,
         check=False,
     )
     if synced.returncode != 0:
         logger.warning("candidate dependency sync failed (rc=%d)", synced.returncode)
         _remove_tree(candidate, boundary=runtime_root)
-        return None
+        return None, "replacement environment failed dependency sync"
 
     healthy, detail, _ = _smoke_candidate_venv(candidate)
     if not healthy:
         logger.warning("candidate venv smoke failed: %s", detail)
         _remove_tree(candidate, boundary=runtime_root)
-        return None
-    return candidate
+        return None, "replacement environment did not pass import smoke tests"
+    return candidate, ""
 
 
 def _rename_with_retry(source: Path, destination: Path) -> None:
@@ -1153,7 +1168,7 @@ def repair_vulnerable_runtime(
             )
         generation, python, candidate_info = provisioned
 
-        candidate = _stage_candidate_venv(
+        candidate, staging_detail = _stage_candidate_venv(
             uv_bin,
             project_root=root,
             generation=generation,
@@ -1163,7 +1178,7 @@ def repair_vulnerable_runtime(
             _remove_tree(generation, boundary=managed_python_install_dir(root))
             return RuntimeRepairResult(
                 "failed",
-                "replacement environment did not pass dependency and import smoke tests",
+                staging_detail or "replacement environment could not be staged",
                 sqlite_before=current.sqlite_version_string,
                 sqlite_after=candidate_info.sqlite_version_string,
             )
