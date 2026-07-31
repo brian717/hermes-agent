@@ -74,6 +74,15 @@ describe('formatProbeFailedMessage', () => {
     assert.ok(msg.includes('hermes update'))
     assert.ok(msg.includes('retry'))
   })
+
+  it('a timeout says so instead of blaming open windows', () => {
+    const msg = formatProbeFailedMessage(true)
+
+    assert.ok(msg.includes('hermes update'))
+    assert.match(msg, /longer than/i)
+    // Nothing was holding the install, so do not send the user window-hunting.
+    assert.doesNotMatch(msg, /Close other Hermes windows/i)
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -182,9 +191,47 @@ describe('scanVenvBlockers', () => {
     assert.equal((await scanVenvBlockers('/r', execReturn(blockedJson), stubVenv)).kind, 'blocked')
   })
 
+  function execTimeout(): any {
+    return (async (...args: any[]) => {
+      // Shape of an execFile child killed at its timeout: no status, no exit
+      // code, just killed + the signal it was killed with.
+      const e: any = new Error('Command failed')
+      e.killed = true
+      e.signal = 'SIGTERM'
+      e.status = null
+      e.code = null
+      throw e
+    }) as any
+  }
+
   it('non-zero exit is probe-failure', async () => {
     const o = await scanVenvBlockers('/r', execThrow(2, 'ModuleNotFoundError'), stubVenv)
     assert.equal(o.kind, 'probe-failure')
+    assert.notEqual((o as any).timedOut, true)
+  })
+
+  it('a timed-out scan is flagged as a timeout, not a bare exit code -1', async () => {
+    const o = await scanVenvBlockers('/r', execTimeout(), stubVenv)
+
+    assert.equal(o.kind, 'probe-failure')
+    assert.equal((o as any).timedOut, true)
+    assert.match((o as any).error, /timed out/i)
+    assert.doesNotMatch((o as any).error, /exit code/i)
+  })
+
+  it('the scan budget leaves room for a busy Windows process table', async () => {
+    // A 500+ process table needs well over 15s on Windows, where psutil has
+    // to query each process individually.  Regression guard for #75460.
+    const calls: any[] = []
+
+    const spy = (async (cmd: string, args: string[], opts: any) => {
+      calls.push(opts.timeout)
+
+      return { stdout: okJson, stderr: '' }
+    }) as any
+
+    await scanVenvBlockers('/r', spy, stubVenv)
+    assert.ok(calls[0] >= 60000, `expected a generous scan budget, got ${calls[0]}ms`)
   })
 
   it('missing venv python is probe-failure', async () => {

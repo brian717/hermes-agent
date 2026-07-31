@@ -34,7 +34,7 @@ import sys
 import time as _time
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from hermes_cli.config import get_hermes_home
 
@@ -2569,6 +2569,42 @@ def _venv_core_imports_healthy() -> tuple[bool, str]:
         return False, "; ".join(missing[:4])
     return True, ""
 
+def _proc_lazy_attr(proc: Any, attr: str) -> Any:
+    """Read *attr* from a psutil process, querying it only if not prefetched.
+
+    ``process_iter(attrs=[...])`` fills ``proc.info`` up front; anything left
+    out has to be asked for per-process. Callers use this to keep the
+    expensive Windows queries (``cmdline``, ``cwd``) off the hot path.
+    Returns ``None`` when the process is gone or access is denied.
+    """
+    try:
+        info = proc.info
+    except Exception:
+        info = {}
+    if isinstance(info, dict) and attr in info:
+        return info[attr]
+    try:
+        return getattr(proc, attr)()
+    except Exception:
+        return None
+
+
+def _may_hold_venv_extensions(exe_norm: str, name: str, venv_prefix: str, root_prefix: str) -> bool:
+    """Cheap pre-filter: could this process plausibly import from the venv?
+
+    Only a Python interpreter can map the venv's ``.pyd`` files, so a process
+    is worth the expensive ``cmdline``/``cwd`` lookup only when it runs from
+    the install tree or is named like an interpreter or one of its
+    trampolines (``uv.exe``, the ``py`` launcher, the ``hermes`` shim).
+    Decided from ``exe``/``name`` alone, both of which ``process_iter``
+    prefetches cheaply.
+    """
+    if exe_norm.startswith(venv_prefix) or exe_norm.startswith(root_prefix):
+        return True
+    stem = Path(name or exe_norm).stem.lower()
+    return stem.startswith(("python", "hermes")) or stem in {"uv", "uvw", "py", "pyw"}
+
+
 def _detect_venv_python_processes(
     *, exclude_pids: set[int] | None = None
 ) -> list[tuple[int, str, str]]:
@@ -2614,8 +2650,14 @@ def _detect_venv_python_processes(
         pass
 
     matches: list[tuple[int, str, str]] = []
+    # Prefetch only the cheap attributes. On Windows ``cmdline`` and ``cwd``
+    # are each a separate per-process query (~25ms), so asking for them here
+    # would cost the whole scan budget on a box with a large process table —
+    # 500+ processes is enough to blow the Desktop preflight's timeout and
+    # leave the update button permanently stuck. They are fetched below, for
+    # the handful of processes that survive the exe/name pre-filter.
     try:
-        proc_iter = psutil.process_iter(["pid", "exe", "name", "cmdline", "cwd"])
+        proc_iter = psutil.process_iter(["pid", "exe", "name"])
     except Exception:
         return []
     for proc in proc_iter:
@@ -2631,9 +2673,12 @@ def _detect_venv_python_processes(
             exe_norm = str(Path(exe).resolve()).lower()
         except (OSError, ValueError):
             exe_norm = str(exe).lower()
-        cmdline_raw = " ".join(info.get("cmdline") or [])
+        name = info.get("name") or Path(exe).name
+        if not _may_hold_venv_extensions(exe_norm, str(name), venv_prefix, root_prefix):
+            continue
+        cmdline_raw = " ".join(_proc_lazy_attr(proc, "cmdline") or [])
         cmdline_low = cmdline_raw.lower()
-        cwd_low = str(info.get("cwd") or "").lower().rstrip(os.sep) + os.sep
+        cwd_low = str(_proc_lazy_attr(proc, "cwd") or "").lower().rstrip(os.sep) + os.sep
 
         # Primary match: the executable itself lives under this venv
         # (venv\Scripts\python(w).exe — the desktop backend / gateway case).
@@ -2650,7 +2695,6 @@ def _detect_venv_python_processes(
                 is_holder = True
         if not is_holder:
             continue
-        name = info.get("name") or Path(exe).name
         matches.append((int(pid), str(name), cmdline_raw[:120]))
     return matches
 

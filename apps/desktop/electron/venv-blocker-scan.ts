@@ -32,13 +32,17 @@ export interface VenvBlockerScanResult {
 export type ScanOutcome =
   | { kind: 'clear'; result: VenvBlockerScanResult }
   | { kind: 'blocked'; result: VenvBlockerScanResult }
-  | { kind: 'probe-failure'; error: string }
+  | { kind: 'probe-failure'; error: string; timedOut?: boolean }
 
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
 
-const SCAN_TIMEOUT_MS = 15000
+// Generous on purpose.  The scan is a psutil walk of the whole process table
+// and a busy Windows box can legitimately need well over 15s; a budget that
+// sits at the anticipated worst case turns "machine is busy" into "updates
+// are permanently broken", because every retry is capped the same way.
+const SCAN_TIMEOUT_MS = 60000
 const SCAN_MODULE = 'hermes_cli._scan_venv_blockers'
 
 // ---------------------------------------------------------------------------
@@ -139,6 +143,17 @@ export async function scanVenvBlockers(
 
     stdout = String((proc as any).stdout ?? '')
   } catch (err: any) {
+    // A child killed by the execFile timeout has neither `status` nor `code`,
+    // so the generic branch reports "exit code -1" and the user is told to go
+    // close windows that were never the problem.  Name the timeout instead.
+    if (err && (err.killed === true || err.signal != null || err.code === 'ETIMEDOUT')) {
+      return {
+        kind: 'probe-failure',
+        error: `scan timed out after ${SCAN_TIMEOUT_MS}ms`,
+        timedOut: true
+      }
+    }
+
     const diag = [`exit code ${err.status ?? err.code ?? -1}`]
 
     if (err.stderr) {
@@ -202,9 +217,22 @@ export function formatBlockerMessage(result: VenvBlockerScanResult): string {
 }
 
 /**
- * Build a probe-failure error message.
+ * Build a probe-failure error message.  A scan that ran out of time gets its
+ * own wording — telling the user to close windows is actively misleading when
+ * nothing was holding the install and the machine was merely busy.
  */
-export function formatProbeFailedMessage(): string {
+export function formatProbeFailedMessage(timedOut = false): string {
+  if (timedOut) {
+    return (
+      'Update aborted: verifying the Hermes installation took longer than ' +
+      `${Math.round(SCAN_TIMEOUT_MS / 1000)}s.\n` +
+      '\n' +
+      'This usually means the machine is busy, not that Hermes is in use.\n' +
+      'Retry when it is quieter, or run `hermes update` in a terminal — that\n' +
+      'path does not run this check.'
+    )
+  }
+
   return (
     'Update aborted: Desktop could not verify the Hermes installation is free.\n' +
     '\n' +
