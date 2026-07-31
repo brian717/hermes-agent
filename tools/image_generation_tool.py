@@ -25,6 +25,7 @@ import logging
 import os
 import datetime
 import threading
+import time
 import uuid
 from typing import Any, Dict, Optional
 
@@ -1259,6 +1260,80 @@ def _read_configured_image_provider():
     return None
 
 
+# ---------------------------------------------------------------------------
+# empty_response: bounded retry + structured evidence
+# ---------------------------------------------------------------------------
+#
+# Backends occasionally complete a generation call without ever emitting an
+# image (``success=false``/``error_type="empty_response"``) — observed for
+# Codex-routed ``gpt-image-2-*`` with call durations from ~6s to ~136s
+# (#35120). It is a transient provider-side miss, distinct from a safety
+# rejection, a network failure, or an invalid prompt, and a single re-issue
+# usually succeeds. Retry it exactly once here — at the one seam every
+# plugin-registered provider passes through, so no backend has to reimplement
+# it — then hand the model structured evidence plus an explicit
+# "already retried" hint so it doesn't burn the rest of the turn re-calling
+# the tool itself. Other error types are never retried: they are deterministic
+# and a second identical call only wastes time and money.
+
+_EMPTY_RESPONSE_MAX_ATTEMPTS = 2
+
+_EMPTY_RESPONSE_HINT = (
+    "The backend completed the call but returned no image. This was already "
+    "retried once automatically — do not call image_generate again for the "
+    "same prompt in this turn. Tell the user it failed and offer to retry "
+    "later, simplify the prompt, or switch the image_gen provider/model."
+)
+
+
+def _is_empty_response(result: Any) -> bool:
+    """True for a provider result whose failure class is ``empty_response``."""
+    return (
+        isinstance(result, dict)
+        and result.get("success") is False
+        and result.get("error_type") == "empty_response"
+    )
+
+
+def _generate_with_empty_response_retry(provider, kwargs: Dict[str, Any]):
+    """Call ``provider.generate(**kwargs)``, retrying once on ``empty_response``.
+
+    Returns the provider's result untouched for every other outcome. An
+    ``empty_response`` that survives the retry is annotated with the attempt
+    count, whether a retry happened, the wall-clock cost of the whole
+    sequence, and a recovery hint. Exceptions propagate to the caller's
+    existing handlers — only the empty-but-successful-call class is retried.
+    """
+    started = time.monotonic()
+    attempts = 0
+    result = None
+
+    while attempts < _EMPTY_RESPONSE_MAX_ATTEMPTS:
+        attempts += 1
+        result = provider.generate(**kwargs)
+        if not _is_empty_response(result):
+            return result
+        if attempts < _EMPTY_RESPONSE_MAX_ATTEMPTS:
+            logger.warning(
+                "image_gen provider '%s' returned no image (attempt %d/%d); retrying once",
+                getattr(provider, "name", "?"), attempts, _EMPTY_RESPONSE_MAX_ATTEMPTS,
+            )
+
+    duration = round(time.monotonic() - started, 3)
+    logger.warning(
+        "image_gen provider '%s' returned no image after %d attempt(s) in %.1fs",
+        getattr(provider, "name", "?"), attempts, duration,
+    )
+
+    return {
+        **result,
+        "attempts": attempts,
+        "retried": attempts > 1,
+        "duration_seconds": duration,
+        "hint": _EMPTY_RESPONSE_HINT,
+    }
+
+
 def _dispatch_to_plugin_provider(
     prompt: str,
     aspect_ratio: str,
@@ -1279,6 +1354,10 @@ def _dispatch_to_plugin_provider(
     ``image_url`` / ``reference_image_urls`` enable image-to-image / editing:
     they are forwarded to the provider's ``generate()`` so the backend can
     route to its edit endpoint.
+
+    A provider result of ``error_type="empty_response"`` is retried once and
+    then annotated with ``attempts`` / ``retried`` / ``duration_seconds`` /
+    ``hint`` — see ``_generate_with_empty_response_retry``.
     """
     configured = _read_configured_image_provider()
     if not configured or configured == "fal":
@@ -1334,7 +1413,7 @@ def _dispatch_to_plugin_provider(
             norm_refs = normalize_reference_images(reference_image_urls)
         if norm_refs:
             kwargs["reference_image_urls"] = norm_refs
-        result = provider.generate(**kwargs)
+        result = _generate_with_empty_response_retry(provider, kwargs)
     except TypeError as exc:
         # A provider whose generate() signature predates image_url support
         # (third-party plugin not yet updated) — retry without the new kwargs
@@ -1479,7 +1558,7 @@ def _maybe_route_managed_krea(
             norm_refs = normalize_reference_images(reference_image_urls)
         if norm_refs:
             kwargs["reference_image_urls"] = norm_refs
-        result = provider.generate(**kwargs)
+        result = _generate_with_empty_response_retry(provider, kwargs)
     except Exception as exc:  # noqa: BLE001
         logger.warning("Managed Krea routing failed: %s", exc)
         return json.dumps({
