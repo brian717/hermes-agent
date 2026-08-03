@@ -126,6 +126,30 @@ def _is_pausable_gateway(cmdline: str) -> bool:
     return looks_like_gateway_command_line(cmdline)
 
 
+def _is_hermes_owned(cmdline: str) -> bool:
+    """Return True when *cmdline* belongs to Hermes rather than a third party.
+
+    The path-based detector also flags foreign processes that happen to run
+    this install's interpreter (a hand-started ``python.exe -m http.server``
+    under the install dir). They still block the update, but the Desktop
+    dialog must not call them "another Hermes process" and tell the user to
+    close Hermes windows that do not exist — see issue #77422.
+
+    Delegates to ``update_cmd._is_hermes_owned_holder`` so the CLI holders
+    message and this JSON scan classify identically. An import failure counts
+    as Hermes-owned, which is the pre-classification wording and never
+    invents a "not a Hermes process" claim the scan cannot back up.
+    """
+    try:
+        from hermes_cli.main import _is_hermes_owned_holder  # noqa: PLC0415
+    except Exception:
+        return True
+    try:
+        return bool(_is_hermes_owned_holder(cmdline))
+    except Exception:
+        return True
+
+
 def main() -> None:
     """Entry point.  Prints one JSON doc to stdout.  Exits 0 for valid scan."""
     try:
@@ -145,6 +169,10 @@ def main() -> None:
             "pid": pid,
             "name": name,
             "cmdline": _redact_sensitive_cmdline(cmdline),
+            # Classified on the RAW cmdline: redaction truncates everything
+            # after a sensitive flag, which can drop the `-m hermes_cli.main`
+            # that identifies the process as ours.
+            "hermes_owned": _is_hermes_owned(cmdline),
         }
         for pid, name, cmdline in matches
         if not _is_pausable_gateway(cmdline)

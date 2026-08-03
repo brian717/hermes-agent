@@ -56,7 +56,9 @@ describe('formatBlockerMessage', () => {
   it('includes PID, name, cmdline, remote-client warning, and retry suggestion', () => {
     const msg = formatBlockerMessage({
       blocked: true,
-      processes: [{ pid: 101, name: 'python.exe', cmdline: 'serve --host 10.0.0.1' }]
+      processes: [
+        { pid: 101, name: 'python.exe', cmdline: 'serve --host 10.0.0.1', hermesOwned: true }
+      ]
     })
 
     assert.ok(msg.includes('PID 101'))
@@ -65,6 +67,48 @@ describe('formatBlockerMessage', () => {
     assert.ok(msg.includes('remote backend'))
     assert.ok(msg.includes('retry'))
     assert.ok(!msg.includes('force-venv'))
+  })
+
+  it('keeps the Hermes-process wording when every blocker is ours', () => {
+    const msg = formatBlockerMessage({
+      blocked: true,
+      processes: [
+        { pid: 101, name: 'python.exe', cmdline: '-m hermes_cli.main serve', hermesOwned: true }
+      ]
+    })
+
+    assert.ok(msg.includes('another Hermes process is using this installation'))
+    assert.ok(!msg.includes('not a Hermes process'))
+  })
+
+  it('names a foreign blocker instead of blaming a Hermes process (#77422)', () => {
+    const msg = formatBlockerMessage({
+      blocked: true,
+      processes: [
+        { pid: 21544, name: 'python.exe', cmdline: '-m http.server 8077', hermesOwned: false }
+      ]
+    })
+
+    assert.ok(!msg.includes('another Hermes process is using this installation'))
+    assert.ok(msg.includes('PID 21544'))
+    assert.ok(msg.includes('http.server'))
+    assert.ok(msg.includes('not a Hermes process'))
+    assert.ok(msg.includes('Stop them by PID'))
+  })
+
+  it('marks only the foreign entries when blockers are mixed', () => {
+    const msg = formatBlockerMessage({
+      blocked: true,
+      processes: [
+        { pid: 1, name: 'python.exe', cmdline: '-m hermes_cli.main serve', hermesOwned: true },
+        { pid: 2, name: 'python.exe', cmdline: '-m http.server 8077', hermesOwned: false }
+      ]
+    })
+
+    const marked = msg.split('\n').filter((line) => line.includes('not a Hermes process'))
+
+    assert.equal(marked.length, 1)
+    assert.ok(marked[0].includes('PID 2'))
   })
 })
 
@@ -135,6 +179,36 @@ describe('parseVenvBlockerScanOutput', () => {
   it('process name must be non-empty string', () => {
     assert.equal(
       parseVenvBlockerScanOutput(ok({ blocked: true, processes: [{ pid: 1, name: '', cmdline: 'c' }] })).kind,
+      'probe-failure'
+    )
+  })
+
+  it('hermes_owned=false is carried through', () => {
+    const o = parseVenvBlockerScanOutput(
+      ok({
+        blocked: true,
+        processes: [{ pid: 1, name: 'p', cmdline: 'c', hermes_owned: false }]
+      })
+    )
+
+    assert.equal(o.kind, 'blocked')
+    assert.equal(o.kind === 'blocked' && o.result.processes[0].hermesOwned, false)
+  })
+
+  it('missing hermes_owned defaults to Hermes-owned', () => {
+    const o = parseVenvBlockerScanOutput(
+      ok({ blocked: true, processes: [{ pid: 1, name: 'p', cmdline: 'c' }] })
+    )
+
+    assert.equal(o.kind, 'blocked')
+    assert.equal(o.kind === 'blocked' && o.result.processes[0].hermesOwned, true)
+  })
+
+  it('non-boolean hermes_owned is rejected', () => {
+    assert.equal(
+      parseVenvBlockerScanOutput(
+        ok({ blocked: true, processes: [{ pid: 1, name: 'p', cmdline: 'c', hermes_owned: 'no' }] })
+      ).kind,
       'probe-failure'
     )
   })

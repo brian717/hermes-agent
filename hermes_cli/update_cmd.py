@@ -2914,15 +2914,69 @@ def _detect_venv_python_processes(
         matches.append((int(pid), str(name), cmdline_raw[:120]))
     return matches
 
+# Command-line tokens that mark a venv holder as Hermes-owned. Matched only
+# after the install root has been stripped out, so the install path itself
+# (`...\hermes\hermes-agent\venv\Scripts\python.exe`) never counts as evidence.
+_HERMES_OWNED_CMDLINE_TOKENS: tuple[str, ...] = (
+    "hermes_cli",
+    "hermes-setup",
+    "hermes.exe",
+    "hermesw.exe",
+)
+
+
+def _is_hermes_owned_holder(cmdline: str, install_root: object | None = None) -> bool:
+    """Return True when a venv holder is a Hermes process, not a foreign one.
+
+    ``_detect_venv_python_processes()`` matches on paths, so it also flags
+    third-party processes that merely run this install's interpreter — a
+    hand-started ``venv\\Scripts\\python.exe -m http.server 8077``, an
+    operator's REPL. Those block the update just as hard (they keep
+    ``python.exe`` and its ``.pyd`` files mapped), but telling the user to
+    "close other Hermes windows" is unactionable: there are none.
+
+    The install path is stripped before matching because the default Windows
+    location (``%LOCALAPPDATA%\\hermes\\hermes-agent``) contains "hermes" in
+    every holder's argv[0] — a naive substring test calls everything
+    Hermes-owned. What remains is the invocation itself, so
+    ``-m hermes_cli.main serve`` is ours and ``-m http.server`` is not.
+
+    Never raises; an unreadable install root just means no stripping.
+    """
+    low = (cmdline or "").lower()
+    if not low:
+        return False
+
+    roots: list[str] = []
+    try:
+        root = install_root if install_root is not None else _m().PROJECT_ROOT
+        root_path = Path(str(root))
+        for candidate in (root_path, root_path.resolve()):
+            text = str(candidate).lower().rstrip(os.sep)
+            if text and text not in roots:
+                roots.append(text)
+    except Exception:
+        pass
+
+    for root_text in roots:
+        low = low.replace(root_text, "")
+
+    return any(token in low for token in _HERMES_OWNED_CMDLINE_TOKENS)
+
+
 def _format_venv_python_holders_message(matches: list[tuple[int, str, str]]) -> str:
     """Explain which venv processes block the update and how to clear them."""
-    lines = [
-        "✗ Other Hermes processes are running from this install's venv:",
-    ]
+    foreign = [m for m in matches if not _is_hermes_owned_holder(m[2])]
+    if foreign:
+        lines = ["✗ Processes are running from this install's venv:"]
+    else:
+        lines = ["✗ Other Hermes processes are running from this install's venv:"]
     for pid, name, cmdline in matches[:6]:
         hint = ""
         low = cmdline.lower()
-        if "serve" in low or "dashboard" in low:
+        if not _is_hermes_owned_holder(cmdline):
+            hint = "  ← not a Hermes process"
+        elif "serve" in low or "dashboard" in low:
             hint = "  ← Hermes Desktop backend (close the desktop app)"
         elif "gateway" in low:
             hint = "  ← gateway"
@@ -2936,9 +2990,18 @@ def _format_venv_python_holders_message(matches: list[tuple[int, str, str]]) -> 
     lines.append(
         "  dependency update would fail partway and leave a broken install."
     )
-    lines.append(
-        "  Close the Hermes desktop app / other Hermes terminals, then re-run:"
-    )
+    if foreign:
+        lines.append(
+            "  The processes marked above are not Hermes — stop them by PID"
+        )
+        lines.append(
+            "  (they are yours, not the app's), close any Hermes desktop app /"
+        )
+        lines.append("  terminals, then re-run:")
+    else:
+        lines.append(
+            "  Close the Hermes desktop app / other Hermes terminals, then re-run:"
+        )
     lines.append("    hermes update")
     lines.append("  (or use `hermes update --force-venv` to proceed anyway at your own risk)")
     return "\n".join(lines)

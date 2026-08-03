@@ -22,6 +22,15 @@ export interface VenvBlockerProcess {
   pid: number
   name: string
   cmdline: string
+  /**
+   * False when the blocker is a third-party process that merely runs this
+   * install's interpreter (a hand-started `python.exe -m http.server` under
+   * the install dir).  It still blocks the update, but "close other Hermes
+   * windows" is unactionable advice for it.  Defaults to true when the
+   * scanner does not report the field — an older venv scanner during a
+   * partial update must not turn every blocker into a "not Hermes" claim.
+   */
+  hermesOwned: boolean
 }
 
 export interface VenvBlockerScanResult {
@@ -77,7 +86,7 @@ export function parseVenvBlockerScanOutput(raw: string): ScanOutcome {
       return { kind: 'probe-failure', error: 'process entry must be an object' }
     }
 
-    const { pid, name, cmdline } = entry
+    const { pid, name, cmdline, hermes_owned: hermesOwned } = entry
 
     if (!Number.isInteger(pid) || pid <= 0) {
       return { kind: 'probe-failure', error: 'process pid must be a positive integer' }
@@ -91,7 +100,11 @@ export function parseVenvBlockerScanOutput(raw: string): ScanOutcome {
       return { kind: 'probe-failure', error: 'process cmdline must be a string' }
     }
 
-    processes.push({ pid, name, cmdline })
+    if (hermesOwned !== undefined && typeof hermesOwned !== 'boolean') {
+      return { kind: 'probe-failure', error: 'process hermes_owned must be a boolean' }
+    }
+
+    processes.push({ pid, name, cmdline, hermesOwned: hermesOwned !== false })
   }
 
   // Reject inconsistent combinations
@@ -176,15 +189,19 @@ export function resolveVenvPython(updateRoot: string): string | null {
  * Does NOT recommend --force-venv.
  */
 export function formatBlockerMessage(result: VenvBlockerScanResult): string {
-  const lines = [
-    'Update aborted: another Hermes process is using this installation.',
-    '',
-    'These processes must be stopped before updating:',
-    ''
-  ]
+  const foreign = result.processes.filter((proc) => !proc.hermesOwned)
+
+  const header =
+    foreign.length > 0
+      ? 'Update aborted: another process is using this installation.'
+      : 'Update aborted: another Hermes process is using this installation.'
+
+  const lines = [header, '', 'These processes must be stopped before updating:', '']
 
   for (const proc of result.processes.slice(0, 10)) {
-    lines.push(`  PID ${proc.pid}  ${proc.name}  ${proc.cmdline}`)
+    const tag = proc.hermesOwned ? '' : '  <- not a Hermes process'
+
+    lines.push(`  PID ${proc.pid}  ${proc.name}  ${proc.cmdline}${tag}`)
   }
 
   if (result.processes.length > 10) {
@@ -192,6 +209,16 @@ export function formatBlockerMessage(result: VenvBlockerScanResult): string {
   }
 
   lines.push('')
+
+  if (foreign.length > 0) {
+    // Naming the foreign process is the whole point: telling the user to
+    // close Hermes windows they do not have is a dead end through the UI.
+    lines.push(
+      'The processes marked above are not Hermes — they are yours, running ' +
+        "from this install's Python.  Stop them by PID."
+    )
+  }
+
   lines.push(
     'Close the terminal, app, or service owning that process.  If it is a ' +
       'remote backend, stopping it will disconnect remote clients.'

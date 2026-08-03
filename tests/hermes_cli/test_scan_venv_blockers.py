@@ -212,3 +212,89 @@ def test_main_desktop_serve_backend_still_blocks(monkeypatch, capsys):
     assert data["blocked"] is True
     assert [p["pid"] for p in data["processes"]] == [78]
     assert data["pausable_gateways"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Hermes-owned vs foreign classification (issue #77422)
+#
+# The detector matches on paths, so a hand-started `python.exe -m http.server`
+# run from the install's venv is reported as a blocker. It must not be
+# described as "another Hermes process": the user has no Hermes window to
+# close, so the Desktop dialog dead-ends.
+# ---------------------------------------------------------------------------
+
+_INSTALL_ROOT = r"C:\Users\u\AppData\Local\hermes\hermes-agent"
+
+
+@pytest.mark.parametrize(
+    "cmdline",
+    [
+        rf"{_INSTALL_ROOT}\venv\Scripts\python.exe -m hermes_cli.main serve --port 8756",
+        rf"{_INSTALL_ROOT}\venv\Scripts\python.exe -m hermes_cli.main gateway run",
+        rf"{_INSTALL_ROOT}\venv\Scripts\hermes.exe update --yes",
+        rf'"{_INSTALL_ROOT}\venv\Scripts\hermesw.exe" serve',
+        r"C:\Users\u\.hermes\hermes-setup.exe update --yes --gateway",
+        # case-insensitive: Windows hands back mixed-case paths
+        rf"{_INSTALL_ROOT.upper()}\VENV\SCRIPTS\PYTHON.EXE -m HERMES_CLI.main serve",
+    ],
+)
+def test_is_hermes_owned_holder_accepts_hermes_invocations(cmdline: str) -> None:
+    from hermes_cli.update_cmd import _is_hermes_owned_holder
+
+    assert _is_hermes_owned_holder(cmdline, _INSTALL_ROOT) is True
+
+
+@pytest.mark.parametrize(
+    "cmdline",
+    [
+        # the reported case: a preview server started by hand, running the
+        # install's interpreter. "hermes" appears only in the install path.
+        rf"{_INSTALL_ROOT}\venv\Scripts\python.exe -m http.server 8077",
+        # operator REPL from the same venv
+        rf"{_INSTALL_ROOT}\venv\Scripts\python.exe",
+        # unrelated script that imports from the venv
+        rf"{_INSTALL_ROOT}\venv\Scripts\python.exe C:\work\scrape.py --out data.json",
+        "",
+    ],
+)
+def test_is_hermes_owned_holder_rejects_foreign_processes(cmdline: str) -> None:
+    from hermes_cli.update_cmd import _is_hermes_owned_holder
+
+    assert _is_hermes_owned_holder(cmdline, _INSTALL_ROOT) is False
+
+
+def test_main_marks_foreign_holder_not_hermes_owned(monkeypatch, capsys):
+    """A stray `-m http.server` blocker must be reported with
+    hermes_owned=False so the Desktop dialog can name it instead of telling
+    the user to close Hermes windows that do not exist."""
+    http_server = (
+        21544,
+        "python.exe",
+        r"C:\x\venv\Scripts\python.exe -m http.server 8077",
+    )
+    serve = (
+        78,
+        "python.exe",
+        r"C:\x\venv\Scripts\python.exe -m hermes_cli.main serve --host 127.0.0.1",
+    )
+    code, data = _run_main_with_detector(monkeypatch, capsys, [http_server, serve])
+    assert code == 0
+    assert data["blocked"] is True
+    owned = {p["pid"]: p["hermes_owned"] for p in data["processes"]}
+    assert owned == {21544: False, 78: True}
+
+
+def test_main_classifies_on_raw_cmdline_before_redaction(monkeypatch, capsys):
+    """Redaction truncates everything after a sensitive flag; classification
+    must run on the raw cmdline or a redacted Hermes process looks foreign."""
+    serve = (
+        90,
+        "python.exe",
+        r"C:\x\venv\Scripts\python.exe --token ghp_abc123 -m hermes_cli.main serve",
+    )
+    code, data = _run_main_with_detector(monkeypatch, capsys, [serve])
+    assert code == 0
+    proc = data["processes"][0]
+    assert "hermes_cli" not in proc["cmdline"]  # redaction cut it off
+    assert "ghp_abc123" not in proc["cmdline"]
+    assert proc["hermes_owned"] is True

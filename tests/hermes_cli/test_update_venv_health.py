@@ -157,3 +157,45 @@ def _run_update_until_guard(args):
 def test_venv_holder_guard_force_semantics(force, force_venv, expected, capsys):
     result = _run_update_until_guard(_update_args(force=force, force_venv=force_venv))
     assert result == expected, capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# _format_venv_python_holders_message — foreign vs Hermes-owned blockers
+#
+# The guard also catches third-party processes running the install's
+# interpreter. Calling those "other Hermes processes" and telling the user to
+# close Hermes windows is unactionable — issue #77422.
+# ---------------------------------------------------------------------------
+
+
+def test_holders_message_keeps_hermes_wording_for_hermes_processes():
+    msg = cli_main._format_venv_python_holders_message(
+        [(101, "python.exe", r"C:\x\venv\Scripts\python.exe -m hermes_cli.main serve")]
+    )
+    assert "Other Hermes processes are running" in msg
+    assert "not a Hermes process" not in msg
+    assert "Close the Hermes desktop app" in msg
+
+
+def test_holders_message_marks_foreign_process():
+    msg = cli_main._format_venv_python_holders_message(
+        [(21544, "python.exe", r"C:\x\venv\Scripts\python.exe -m http.server 8077")]
+    )
+    assert "Other Hermes processes are running" not in msg
+    assert "PID 21544" in msg
+    assert "http.server" in msg
+    assert "not a Hermes process" in msg
+    assert "stop them by pid" in msg.lower()
+
+
+def test_holders_message_marks_only_the_foreign_entry_when_mixed():
+    msg = cli_main._format_venv_python_holders_message(
+        [
+            (101, "python.exe", r"C:\x\venv\Scripts\python.exe -m hermes_cli.main serve"),
+            (21544, "python.exe", r"C:\x\venv\Scripts\python.exe -m http.server 8077"),
+        ]
+    )
+    marked = [line for line in msg.splitlines() if "not a Hermes process" in line]
+    assert len(marked) == 1
+    assert "PID 21544" in marked[0]
+    assert "Hermes Desktop backend" in msg  # the serve hint survives
