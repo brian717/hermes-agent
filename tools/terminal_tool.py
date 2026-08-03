@@ -1344,6 +1344,21 @@ def _parse_env_var(name: str, default: str, converter: Any = int, type_label: st
         )
 
 
+def _parse_optional_env_int(name: str):
+    """Parse an optional integer env var, returning None when it is unset.
+
+    Distinct from :func:`_parse_env_var`, which always produces a value: these
+    knobs need an "operator said nothing" state so the backend can leave the
+    provider's own defaults in place instead of overwriting them with a
+    Hermes-side default. An empty string counts as unset (a config bridge that
+    exports ``KEY=`` must not be read as ``0``).
+    """
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return None
+    return _parse_env_var(name, raw)
+
+
 def _safe_getcwd() -> str:
     """Return the current working directory, tolerating a deleted CWD.
 
@@ -1540,6 +1555,16 @@ def _get_env_config() -> Dict[str, Any]:
         "singularity_image": os.getenv("TERMINAL_SINGULARITY_IMAGE", f"docker://{default_image}"),
         "modal_image": os.getenv("TERMINAL_MODAL_IMAGE", default_image),
         "daytona_image": os.getenv("TERMINAL_DAYTONA_IMAGE", default_image),
+        # Daytona sandbox lifecycle (minutes). Unset = leave Daytona's own
+        # defaults alone (auto-stop stays off, as it has always been); set them
+        # to let Daytona reap sandboxes this process may never clean up itself
+        # — a crash or gateway restart otherwise bills them forever (#28804).
+        "daytona_auto_stop_interval": _parse_optional_env_int(
+            "TERMINAL_DAYTONA_AUTO_STOP_INTERVAL"),
+        "daytona_auto_archive_interval": _parse_optional_env_int(
+            "TERMINAL_DAYTONA_AUTO_ARCHIVE_INTERVAL"),
+        "daytona_auto_delete_interval": _parse_optional_env_int(
+            "TERMINAL_DAYTONA_AUTO_DELETE_INTERVAL"),
         "vercel_runtime": os.getenv("TERMINAL_VERCEL_RUNTIME", "").strip(),
         "cwd": cwd,
         "host_cwd": host_cwd,
@@ -1731,6 +1756,9 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
             image=image, cwd=cwd, timeout=timeout,
             cpu=int(cpu), memory=memory, disk=disk,
             persistent_filesystem=persistent, task_id=task_id,
+            auto_stop_interval=cc.get("daytona_auto_stop_interval"),
+            auto_archive_interval=cc.get("daytona_auto_archive_interval"),
+            auto_delete_interval=cc.get("daytona_auto_delete_interval"),
         )
 
     elif env_type == "vercel_sandbox":
@@ -2441,6 +2469,9 @@ def terminal_tool(
                                 "container_persistent": config.get("container_persistent", True),
                                 "modal_mode": config.get("modal_mode", "auto"),
                                 "vercel_runtime": config.get("vercel_runtime", ""),
+                                "daytona_auto_stop_interval": config.get("daytona_auto_stop_interval"),
+                                "daytona_auto_archive_interval": config.get("daytona_auto_archive_interval"),
+                                "daytona_auto_delete_interval": config.get("daytona_auto_delete_interval"),
                                 "docker_volumes": config.get("docker_volumes", []),
                                 "docker_mount_cwd_to_workspace": config.get("docker_mount_cwd_to_workspace", False),
                                 "docker_forward_env": config.get("docker_forward_env", []),

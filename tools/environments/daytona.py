@@ -27,6 +27,25 @@ from tools.environments.file_sync import (
 logger = logging.getLogger(__name__)
 
 
+def _coerce_interval(value, default: int | None, name: str) -> int | None:
+    """Return *value* as an int, falling back to *default* on junk input.
+
+    The intervals arrive from ``terminal.*`` config / ``TERMINAL_DAYTONA_AUTO_*``
+    env vars, so a typo ("30m") must not take the whole backend down — Daytona's
+    reaping is an opt-in safety net, not something worth crashing a sandbox over.
+    """
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        logger.warning(
+            "Daytona: ignoring invalid %s=%r (expected an integer number of "
+            "minutes); using %r instead.", name, value, default,
+        )
+        return default
+
+
 class DaytonaEnvironment(BaseEnvironment):
     """Daytona cloud sandbox execution backend.
 
@@ -47,6 +66,9 @@ class DaytonaEnvironment(BaseEnvironment):
         disk: int = 10240,
         persistent_filesystem: bool = True,
         task_id: str = "default",
+        auto_stop_interval: int | None = None,
+        auto_archive_interval: int | None = None,
+        auto_delete_interval: int | None = None,
     ):
         requested_cwd = cwd
         super().__init__(cwd=cwd, timeout=timeout)
@@ -65,6 +87,21 @@ class DaytonaEnvironment(BaseEnvironment):
             Resources,
             SandboxState,
         )
+
+        # Daytona's own sandbox reaping, in minutes. ``cleanup()`` only runs on
+        # a clean exit and the in-process idle reaper only covers environments
+        # this gateway still tracks, so a crashed worker or a gateway restart
+        # otherwise leaves the sandbox running until the account quota is gone
+        # (#28804). ``None`` means "not configured": creation keeps the
+        # historical ``auto_stop_interval=0`` (reaping off) and omits the
+        # archive/delete params so Daytona's account defaults stay
+        # authoritative, and a resumed sandbox keeps the policy it has.
+        self._auto_stop_interval = _coerce_interval(
+            auto_stop_interval, None, "auto_stop_interval")
+        self._auto_archive_interval = _coerce_interval(
+            auto_archive_interval, None, "auto_archive_interval")
+        self._auto_delete_interval = _coerce_interval(
+            auto_delete_interval, None, "auto_delete_interval")
 
         self._persistent = persistent_filesystem
         self._task_id = task_id
@@ -117,17 +154,32 @@ class DaytonaEnvironment(BaseEnvironment):
                     self._sandbox = None
 
         if self._sandbox is None:
+            create_kwargs = {}
+            if self._auto_archive_interval is not None:
+                create_kwargs["auto_archive_interval"] = self._auto_archive_interval
+            if self._auto_delete_interval is not None:
+                create_kwargs["auto_delete_interval"] = self._auto_delete_interval
             self._sandbox = self._daytona.create(
                 CreateSandboxFromImageParams(
                     image=image,
                     name=sandbox_name,
                     labels=labels,
-                    auto_stop_interval=0,
+                    auto_stop_interval=(
+                        0 if self._auto_stop_interval is None
+                        else self._auto_stop_interval
+                    ),
                     resources=resources,
+                    **create_kwargs,
                 )
             )
             logger.info("Daytona: created sandbox %s for task %s",
                         self._sandbox.id, task_id)
+        else:
+            # A resumed sandbox keeps whatever intervals it was created with,
+            # so re-apply the configured ones — otherwise a long-lived
+            # persistent sandbox never picks up a newly configured reaping
+            # policy and stays unreaped forever.
+            self._apply_lifecycle_intervals()
 
         # Detect remote home dir
         self._remote_home = "/root"
@@ -150,6 +202,32 @@ class DaytonaEnvironment(BaseEnvironment):
         )
         self._sync_manager.sync(force=True)
         self.init_session()
+
+    def _apply_lifecycle_intervals(self) -> None:
+        """Push the configured auto-stop/archive/delete intervals to a sandbox.
+
+        Used on the resume path, where the sandbox already exists and the
+        create-time params no longer apply. Best-effort per setter: an older
+        SDK missing one of them, or a transient API failure, must not stop a
+        session from starting — the sandbox just keeps its previous policy.
+        """
+        setters = (
+            ("set_autostop_interval", self._auto_stop_interval),
+            ("set_auto_archive_interval", self._auto_archive_interval),
+            ("set_auto_delete_interval", self._auto_delete_interval),
+        )
+        for name, interval in setters:
+            if interval is None:
+                continue
+            setter = getattr(self._sandbox, name, None)
+            if setter is None:
+                logger.debug("Daytona: SDK sandbox has no %s()", name)
+                continue
+            try:
+                setter(interval)
+            except Exception as e:
+                logger.warning("Daytona: %s(%s) failed on sandbox %s: %s",
+                               name, interval, getattr(self._sandbox, "id", "?"), e)
 
     def _daytona_upload(self, host_path: str, remote_path: str) -> None:
         """Upload a single file via Daytona SDK."""

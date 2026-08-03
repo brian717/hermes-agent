@@ -325,6 +325,13 @@ terminal:
 #   lifetime_seconds: 300
 #   daytona_image: "nikolaik/python-nodejs:python3.11-nodejs20"
 #   container_disk: 10240          # Daytona max is 10GB per sandbox
+#   # Daytona-side sandbox reaping, in minutes. Hermes only cleans up sandboxes
+#   # it still tracks, so a crashed worker or a gateway restart can leave one
+#   # running (and billing) indefinitely — these hand that job to Daytona.
+#   # Omit a key to leave Daytona's own default in place.
+#   daytona_auto_stop_interval: 30     # Stop after 30 min idle (0 = never stop)
+#   daytona_auto_archive_interval: 60  # Archive 60 min after stop (0 = max allowed)
+#   daytona_auto_delete_interval: 1440 # Delete 24 h after stop (0 = at once, -1 = never)
 
 #
 # --- Container resource limits (docker, singularity, modal, daytona -- ignored for local/ssh) ---

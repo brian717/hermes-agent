@@ -323,3 +323,217 @@ class TestSyncSafety:
         assert "; touch" not in mkdir_cmd.replace(
             "'/root/.hermes/skills/evil; touch /tmp/daytona-owned'", ""
         )
+
+
+# ---------------------------------------------------------------------------
+# Sandbox lifecycle intervals (auto-stop / auto-archive / auto-delete)
+# ---------------------------------------------------------------------------
+
+class TestLifecycleIntervals:
+    """Daytona-side reaping config (#28804).
+
+    ``cleanup()`` only runs on a clean exit and the idle reaper only covers
+    environments this process still tracks, so a crashed worker leaves its
+    sandbox running until the account quota is gone. These knobs hand the
+    job to Daytona itself.
+    """
+
+    @staticmethod
+    def _capture_params(daytona_sdk):
+        params = MagicMock(name="CreateSandboxFromImageParams")
+        daytona_sdk.CreateSandboxFromImageParams = params
+        return params
+
+    def test_defaults_keep_legacy_create_params(self, make_env, daytona_sdk):
+        params = self._capture_params(daytona_sdk)
+
+        make_env(persistent=False)
+
+        kwargs = params.call_args.kwargs
+        assert kwargs["auto_stop_interval"] == 0
+        assert "auto_archive_interval" not in kwargs
+        assert "auto_delete_interval" not in kwargs
+
+    def test_configured_intervals_reach_create_params(self, make_env, daytona_sdk):
+        params = self._capture_params(daytona_sdk)
+
+        make_env(
+            persistent=False,
+            auto_stop_interval=30,
+            auto_archive_interval=60,
+            auto_delete_interval=1440,
+        )
+
+        kwargs = params.call_args.kwargs
+        assert kwargs["auto_stop_interval"] == 30
+        assert kwargs["auto_archive_interval"] == 60
+        assert kwargs["auto_delete_interval"] == 1440
+
+    def test_string_intervals_are_coerced(self, make_env, daytona_sdk):
+        """The config bridge hands values over as env-var strings."""
+        params = self._capture_params(daytona_sdk)
+
+        make_env(persistent=False, auto_stop_interval="15")
+
+        assert params.call_args.kwargs["auto_stop_interval"] == 15
+
+    def test_invalid_interval_falls_back_to_default(self, make_env, daytona_sdk):
+        """A typo must not take the backend down — reaping is a safety net."""
+        params = self._capture_params(daytona_sdk)
+
+        make_env(persistent=False, auto_stop_interval="30m")
+
+        assert params.call_args.kwargs["auto_stop_interval"] == 0
+
+    def test_resumed_sandbox_gets_configured_intervals(self, make_env):
+        existing = _make_sandbox(sandbox_id="sb-existing")
+        existing.process.exec.return_value = _make_exec_response(result="/root")
+
+        make_env(
+            get_side_effect=lambda name: existing,
+            persistent=True,
+            auto_stop_interval=30,
+            auto_archive_interval=60,
+            auto_delete_interval=1440,
+        )
+
+        existing.set_autostop_interval.assert_called_once_with(30)
+        existing.set_auto_archive_interval.assert_called_once_with(60)
+        existing.set_auto_delete_interval.assert_called_once_with(1440)
+
+    def test_resumed_sandbox_untouched_when_unconfigured(self, make_env):
+        existing = _make_sandbox(sandbox_id="sb-existing")
+        existing.process.exec.return_value = _make_exec_response(result="/root")
+
+        make_env(get_side_effect=lambda name: existing, persistent=True)
+
+        existing.set_autostop_interval.assert_not_called()
+        existing.set_auto_archive_interval.assert_not_called()
+        existing.set_auto_delete_interval.assert_not_called()
+
+    def test_setter_failure_does_not_break_startup(self, make_env):
+        existing = _make_sandbox(sandbox_id="sb-existing")
+        existing.process.exec.return_value = _make_exec_response(result="/root")
+        existing.set_autostop_interval.side_effect = RuntimeError("api down")
+
+        env = make_env(
+            get_side_effect=lambda name: existing,
+            persistent=True,
+            auto_stop_interval=30,
+            auto_archive_interval=60,
+        )
+
+        assert env._sandbox is existing
+        # The remaining setters still run — one failure isn't fatal.
+        existing.set_auto_archive_interval.assert_called_once_with(60)
+
+
+class TestLifecycleConfigBridge:
+    """``terminal.daytona_auto_*`` → ``TERMINAL_DAYTONA_AUTO_*`` → backend."""
+
+    def test_env_config_defaults_to_unset(self, monkeypatch):
+        import tools.terminal_tool as terminal_tool
+
+        for var in (
+            "TERMINAL_DAYTONA_AUTO_STOP_INTERVAL",
+            "TERMINAL_DAYTONA_AUTO_ARCHIVE_INTERVAL",
+            "TERMINAL_DAYTONA_AUTO_DELETE_INTERVAL",
+        ):
+            monkeypatch.delenv(var, raising=False)
+
+        config = terminal_tool._get_env_config()
+
+        assert config["daytona_auto_stop_interval"] is None
+        assert config["daytona_auto_archive_interval"] is None
+        assert config["daytona_auto_delete_interval"] is None
+
+    def test_env_config_reads_intervals(self, monkeypatch):
+        import tools.terminal_tool as terminal_tool
+
+        monkeypatch.setenv("TERMINAL_DAYTONA_AUTO_STOP_INTERVAL", "30")
+        monkeypatch.setenv("TERMINAL_DAYTONA_AUTO_ARCHIVE_INTERVAL", "60")
+        monkeypatch.setenv("TERMINAL_DAYTONA_AUTO_DELETE_INTERVAL", "-1")
+
+        config = terminal_tool._get_env_config()
+
+        assert config["daytona_auto_stop_interval"] == 30
+        assert config["daytona_auto_archive_interval"] == 60
+        assert config["daytona_auto_delete_interval"] == -1
+
+    def test_blank_env_var_is_unset_not_zero(self, monkeypatch):
+        """An empty export must not read as "stop immediately"."""
+        import tools.terminal_tool as terminal_tool
+
+        monkeypatch.setenv("TERMINAL_DAYTONA_AUTO_STOP_INTERVAL", "")
+
+        assert terminal_tool._get_env_config()["daytona_auto_stop_interval"] is None
+
+    def test_config_key_maps_to_env_var(self):
+        from hermes_cli.config import terminal_config_env_var_for_key
+
+        assert terminal_config_env_var_for_key(
+            "terminal.daytona_auto_stop_interval"
+        ) == "TERMINAL_DAYTONA_AUTO_STOP_INTERVAL"
+        assert terminal_config_env_var_for_key(
+            "terminal.daytona_auto_archive_interval"
+        ) == "TERMINAL_DAYTONA_AUTO_ARCHIVE_INTERVAL"
+        assert terminal_config_env_var_for_key(
+            "terminal.daytona_auto_delete_interval"
+        ) == "TERMINAL_DAYTONA_AUTO_DELETE_INTERVAL"
+
+    def test_every_container_config_site_carries_the_intervals(self):
+        """Each module that can build a Daytona sandbox must forward them.
+
+        ``execute_code``, the file tools, and the backend probe assemble their
+        own ``container_config`` dicts. A site that omits these keys silently
+        creates an unreaped sandbox while the terminal path honors the config
+        — the same drift that hit ``docker_network`` (#46358).
+        """
+        import ast
+        import inspect
+
+        import agent.prompt_builder as prompt_builder
+        import tools.code_execution_tool as code_execution_tool
+        import tools.file_tools as file_tools
+        import tools.terminal_tool as terminal_tool
+
+        for module in (terminal_tool, file_tools, code_execution_tool, prompt_builder):
+            tree = ast.parse(inspect.getsource(module))
+            sites = 0
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Dict):
+                    continue
+                keys = {k.value for k in node.keys if isinstance(k, ast.Constant)}
+                if "container_persistent" not in keys:
+                    continue
+                sites += 1
+                assert "daytona_auto_stop_interval" in keys, (
+                    f"{module.__name__} builds a container_config without the "
+                    f"Daytona lifecycle keys (line {node.lineno})"
+                )
+            assert sites >= 1, f"expected a container_config site in {module.__name__}"
+
+    def test_gateway_and_cli_bridges_carry_the_keys(self):
+        """All three bridge maps must agree or one launch path silently drops
+        the setting (the asymmetry that bit terminal.docker_network)."""
+        import re
+        from pathlib import Path
+
+        from hermes_cli.config import TERMINAL_CONFIG_ENV_MAP
+
+        keys = (
+            "daytona_auto_stop_interval",
+            "daytona_auto_archive_interval",
+            "daytona_auto_delete_interval",
+        )
+        for key in keys:
+            assert key in TERMINAL_CONFIG_ENV_MAP
+
+        root = Path(__file__).resolve().parents[2]
+        for source in ("cli.py", "gateway/run.py"):
+            text = (root / source).read_text(encoding="utf-8")
+            for key in keys:
+                env_var = TERMINAL_CONFIG_ENV_MAP[key]
+                assert re.search(
+                    rf'"{key}":\s*"{env_var}"', text
+                ), f"{source} does not bridge terminal.{key}"

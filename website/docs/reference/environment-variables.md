@@ -241,6 +241,9 @@ These variables configure the [Tool Gateway](/user-guide/features/tool-gateway) 
 | `TERMINAL_SINGULARITY_IMAGE` | Singularity image or `.sif` path |
 | `TERMINAL_MODAL_IMAGE` | Modal container image |
 | `TERMINAL_DAYTONA_IMAGE` | Daytona sandbox image |
+| `TERMINAL_DAYTONA_AUTO_STOP_INTERVAL` | Minutes of inactivity before Daytona stops the sandbox (`0` = never). Unset leaves Daytona's default |
+| `TERMINAL_DAYTONA_AUTO_ARCHIVE_INTERVAL` | Minutes a stopped Daytona sandbox waits before being archived (`0` = maximum allowed). Unset leaves Daytona's default |
+| `TERMINAL_DAYTONA_AUTO_DELETE_INTERVAL` | Minutes a stopped Daytona sandbox waits before deletion (`0` = immediately, `-1` = never). Unset leaves Daytona's default |
 | `TERMINAL_VERCEL_RUNTIME` | Vercel Sandbox runtime (`node24`, `node22`, `python3.13`) |
 | `TERMINAL_TIMEOUT` | Command timeout in seconds |
 | `TERMINAL_LIFETIME_SECONDS` | Max lifetime for terminal sessions in seconds |
